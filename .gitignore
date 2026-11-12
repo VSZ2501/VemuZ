@@ -1,0 +1,28 @@
+# Dépendances et builds
+node_modules/
+dist/
+build/
+.svelte-kit/
+src-tauri/target/
+src-tauri/gen/
+vite.config.ts.timestamp-*
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Jeux et sauvegardes (jamais versionnés)
+*.nds
+*.sav
+*.dsv
+*.dsi
+*.srl
+
+# BIOS et firmwares
+bios/
+bios*.bin
+firmware*.bin
+*.bios
+*.firmware
+biosnds7.bin
+biosnds9.bin
