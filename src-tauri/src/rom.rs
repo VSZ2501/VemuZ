@@ -6,8 +6,21 @@ use std::path::Path;
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Game {
     pub path: String,
+    /// Titre lu dans l'en-tête de la ROM (tronqué à 12 caractères) ou nom du fichier
     pub title: String,
     pub code: String,
+    /// Titre complet issu de la base GameTDB
+    #[serde(default)]
+    pub db_title: Option<String>,
+    /// Titre choisi par l'utilisateur, prioritaire
+    #[serde(default)]
+    pub custom_title: Option<String>,
+}
+
+impl Game {
+    pub fn display_title(&self) -> &str {
+        self.custom_title.as_deref().or(self.db_title.as_deref()).unwrap_or(&self.title)
+    }
 }
 
 /// Lit le titre et le code du jeu dans l'en-tête NDS (octets 0x00-0x0B et 0x0C-0x0F).
@@ -34,6 +47,8 @@ pub fn read_game(path: &Path) -> Option<Game> {
         path: path.to_string_lossy().into_owned(),
         title,
         code,
+        db_title: None,
+        custom_title: None,
     })
 }
 

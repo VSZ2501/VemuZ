@@ -1,9 +1,16 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
+  import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
 
-  type Game = { path: string; title: string; code: string };
+  type Game = {
+    path: string;
+    title: string;
+    code: string;
+    db_title?: string | null;
+    custom_title?: string | null;
+  };
   type Settings = { melonds_dir: string | null };
 
   let view: "library" | "settings" = $state("library");
@@ -11,14 +18,46 @@
   let settings: Settings = $state({ melonds_dir: null });
   let melondsOk = $state(false);
   let message = $state("");
+  // Jaquettes en cache : code du jeu vers URL affichable
+  let covers: Record<string, string> = $state({});
+
+  // Renommage en cours : chemin du jeu et texte saisi
+  let editing: string | null = $state(null);
+  let draft = $state("");
 
   const errText = (e: unknown) => (typeof e === "string" ? e : String(e));
+  const label = (g: Game) => g.custom_title ?? g.db_title ?? g.title;
+
+  function startEdit(g: Game) {
+    draft = label(g);
+    editing = g.path;
+  }
+
+  async function commitEdit(g: Game) {
+    if (editing !== g.path) return;
+    editing = null;
+    if (draft.trim() === label(g)) return;
+    await update("rename_game", { path: g.path, title: draft });
+  }
+
+  function focusSelect(el: HTMLInputElement) {
+    el.focus();
+    el.select();
+  }
 
   onMount(async () => {
     settings = await invoke<Settings>("get_settings");
     melondsOk = await invoke<boolean>("melonds_ok");
     games = await invoke<Game[]>("list_games");
     if (!melondsOk) view = "settings";
+
+    const cached = await invoke<Record<string, string>>("list_covers");
+    for (const [code, path] of Object.entries(cached)) covers[code] = convertFileSrc(path);
+    await listen<{ code: string; path: string }>("cover-ready", (e) => {
+      covers[e.payload.code] = convertFileSrc(e.payload.path);
+    });
+    await listen<string>("covers-error", (e) => (message = e.payload));
+    await listen("games-updated", async () => (games = await invoke<Game[]>("list_games")));
   });
 
   async function chooseMelonDir() {
@@ -60,6 +99,20 @@
     }
   }
 
+  // Inclinaison de la jaquette à l'opposé de la souris (valeurs de -1 à 1)
+  function tilt(e: MouseEvent) {
+    const el = e.currentTarget as HTMLElement;
+    const r = el.getBoundingClientRect();
+    el.style.setProperty("--x", String(((e.clientX - r.left) / r.width) * 2 - 1));
+    el.style.setProperty("--y", String(((e.clientY - r.top) / r.height) * 2 - 1));
+  }
+
+  function untilt(e: MouseEvent) {
+    const el = e.currentTarget as HTMLElement;
+    el.style.removeProperty("--x");
+    el.style.removeProperty("--y");
+  }
+
   async function launch(g: Game) {
     message = "";
     try {
@@ -86,14 +139,39 @@
     {#if games.length === 0}
       <p class="empty">Aucun jeu. Ajoutez des fichiers .nds.</p>
     {:else}
-      <ul>
+      <ul class="grid">
         {#each games as g (g.path)}
-          <li>
-            <button class="game" onclick={() => launch(g)} disabled={!melondsOk} title={g.path}>
-              <span class="title">{g.title}</span>
-              <span class="code">{g.code}</span>
+          <li class="card">
+            <button
+              class="box"
+              onclick={() => launch(g)}
+              onmousemove={tilt}
+              onmouseleave={untilt}
+              disabled={!melondsOk}
+              title="{g.code}&#10;{g.path}"
+            >
+              {#if covers[g.code]}
+                <img src={covers[g.code]} alt={label(g)} loading="lazy" decoding="async" />
+              {:else}
+                <span class="ph">{label(g)}</span>
+              {/if}
             </button>
-            <button class="rm" onclick={() => update("remove_game", { path: g.path })} title="Retirer de la liste">×</button>
+            {#if editing === g.path}
+              <input
+                class="edit"
+                bind:value={draft}
+                use:focusSelect
+                onblur={() => commitEdit(g)}
+                onkeydown={(e) => {
+                  if (e.key === "Enter") commitEdit(g);
+                  else if (e.key === "Escape") editing = null;
+                }}
+              />
+            {:else}
+              <span class="title" title={label(g)}>{label(g)}</span>
+            {/if}
+            <button class="act ren" onclick={() => startEdit(g)} title="Renommer">✎</button>
+            <button class="act rm" onclick={() => update("remove_game", { path: g.path })} title="Retirer de la liste">×</button>
           </li>
         {/each}
       </ul>
@@ -140,25 +218,86 @@
   button.active {
     border-color: #7a8cff;
   }
-  ul {
+  .grid {
     list-style: none;
     margin: 0;
     padding: 0;
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 16px;
   }
-  li {
+  .card {
+    position: relative;
     display: flex;
-    gap: 4px;
-    margin-bottom: 4px;
+    flex-direction: column;
+    gap: 2px;
   }
-  .game {
-    flex: 1;
+  /* Effet de boîte en 3D, uniquement au survol */
+  .box {
+    padding: 0;
+    border: none;
+    background: #2d2d34;
+    border-radius: 3px;
+    overflow: hidden;
+    display: block;
+    transition: transform 0.15s, box-shadow 0.15s;
+  }
+  /* --x et --y suivent la souris : le côté survolé s'enfonce */
+  .box:hover:not(:disabled) {
+    transform: perspective(600px) rotateX(calc(var(--y, 0) * -12deg)) rotateY(calc(var(--x, 0) * 12deg)) scale(1.04);
+    box-shadow: calc(var(--x, 0) * -8px) calc(var(--y, 0) * -8px + 4px) 14px rgba(0, 0, 0, 0.5);
+  }
+  .box img {
+    display: block;
+    width: 100%;
+    height: auto;
+  }
+  .ph {
     display: flex;
-    justify-content: space-between;
-    text-align: left;
+    align-items: center;
+    justify-content: center;
+    aspect-ratio: 10 / 9;
+    padding: 8px;
+    box-sizing: border-box;
+    font-size: 0.8rem;
+    text-align: center;
+    background: linear-gradient(135deg, #34343e, #25252c);
   }
-  .code {
-    opacity: 0.6;
-    font-family: monospace;
+  .title {
+    font-size: 0.8rem;
+    /* Jusqu'à deux lignes, puis points de suspension */
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    line-height: 1.25;
+  }
+  .edit {
+    font-size: 0.8rem;
+    width: 100%;
+    box-sizing: border-box;
+    background: #2d2d34;
+    color: inherit;
+    border: 1px solid #7a8cff;
+    border-radius: 3px;
+    padding: 0 4px;
+  }
+  .act {
+    position: absolute;
+    top: 2px;
+    padding: 0 6px;
+    display: none;
+  }
+  .rm {
+    right: 2px;
+  }
+  .ren {
+    right: 28px;
+  }
+  .card:hover .act {
+    display: block;
   }
   .msg {
     color: #ffd479;

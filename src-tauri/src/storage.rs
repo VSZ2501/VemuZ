@@ -3,10 +3,15 @@ use std::fs;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
-fn file_path(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+/// Dossier de données de l'application (créé s'il manque).
+pub fn data_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    Ok(dir.join(name))
+    Ok(dir)
+}
+
+fn file_path(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    Ok(data_dir(app)?.join(name))
 }
 
 /// Lit un fichier JSON de l'application. Valeur par défaut s'il est absent ou invalide.

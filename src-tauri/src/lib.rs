@@ -1,6 +1,8 @@
+mod covers;
 mod emulator;
 mod rom;
 mod storage;
+mod titles;
 
 use emulator::{Emulator, MelonDs};
 use rom::Game;
@@ -23,6 +25,8 @@ struct AppState {
     settings: Mutex<Settings>,
     games: Mutex<Vec<Game>>,
     running: AtomicBool,
+    // Vrai quand le worker de jaquettes tourne
+    fetching: AtomicBool,
 }
 
 // ---------- Réglages ----------
@@ -75,9 +79,17 @@ fn add_to_library(app: &AppHandle, state: &AppState, new: Vec<Game>) -> Result<V
             games.push(g);
         }
     }
-    games.sort_by_key(|g| g.title.to_lowercase());
+    games.sort_by_key(|g| g.display_title().to_lowercase());
     storage::save(app, GAMES_FILE, &*games)?;
-    Ok(games.clone())
+    let result = games.clone();
+    drop(games);
+    covers::start(app);
+    Ok(result)
+}
+
+#[tauri::command]
+fn list_covers(app: AppHandle) -> std::collections::HashMap<String, String> {
+    covers::list(&app)
 }
 
 #[tauri::command]
@@ -107,6 +119,19 @@ fn add_folder(app: AppHandle, state: State<AppState>, dir: String) -> Result<Vec
         }
     }
     add_to_library(&app, &state, found)
+}
+
+/// Renomme un jeu. Un titre vide rétablit le titre d'origine.
+#[tauri::command]
+fn rename_game(app: AppHandle, state: State<AppState>, path: String, title: String) -> Result<Vec<Game>, String> {
+    let mut games = state.games.lock().unwrap();
+    let title = title.trim();
+    if let Some(g) = games.iter_mut().find(|g| same_path(&g.path, &path)) {
+        g.custom_title = (!title.is_empty()).then(|| title.to_string());
+    }
+    games.sort_by_key(|g| g.display_title().to_lowercase());
+    storage::save(&app, GAMES_FILE, &*games)?;
+    Ok(games.clone())
 }
 
 #[tauri::command]
@@ -150,6 +175,8 @@ fn launch_game(app: AppHandle, state: State<AppState>, path: String) -> Result<(
             let _ = w.set_focus();
         }
         app.state::<AppState>().running.store(false, Ordering::SeqCst);
+        // Reprend les jaquettes manquantes une fois le jeu fermé
+        covers::start(&app);
     });
     Ok(())
 }
@@ -164,6 +191,7 @@ pub fn run() {
             let state = app.state::<AppState>();
             *state.settings.lock().unwrap() = storage::load(handle, SETTINGS_FILE);
             *state.games.lock().unwrap() = storage::load(handle, GAMES_FILE);
+            covers::start(handle);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -171,9 +199,11 @@ pub fn run() {
             set_melonds_dir,
             melonds_ok,
             list_games,
+            list_covers,
             add_games,
             add_folder,
             remove_game,
+            rename_game,
             launch_game
         ])
         .run(tauri::generate_context!())
