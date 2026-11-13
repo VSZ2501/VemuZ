@@ -15,6 +15,9 @@ pub struct Game {
     /// Titre choisi par l'utilisateur, prioritaire
     #[serde(default)]
     pub custom_title: Option<String>,
+    /// Dernier lancement, en secondes depuis l'epoch Unix
+    #[serde(default)]
+    pub last_played: Option<u64>,
 }
 
 impl Game {
@@ -49,6 +52,7 @@ pub fn read_game(path: &Path) -> Option<Game> {
         code,
         db_title: None,
         custom_title: None,
+        last_played: None,
     })
 }
 

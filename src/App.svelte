@@ -3,6 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { open } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
+  import { KEY_ROWS, SUGGESTED, qtName, toQt } from "./keys";
 
   type Game = {
     path: string;
@@ -10,12 +11,28 @@
     code: string;
     db_title?: string | null;
     custom_title?: string | null;
+    last_played?: number | null;
   };
-  type Settings = { melonds_dir: string | null };
+  type LaunchOptions = { fullscreen: boolean };
+  type Settings = { melonds_dir: string | null; options: LaunchOptions };
+  type EmuConfig = {
+    screen_layout: number;
+    screen_swap: boolean;
+    integer_scaling: boolean;
+    screen_filter: boolean;
+    fast_renderer: boolean;
+    limit_fps: boolean;
+    jit: boolean;
+    volume: number;
+    language: number;
+    direct_boot: boolean;
+    pause_on_blur: boolean;
+    fast_forward: number;
+  };
 
   let view: "library" | "settings" = $state("library");
   let games: Game[] = $state([]);
-  let settings: Settings = $state({ melonds_dir: null });
+  let settings: Settings = $state({ melonds_dir: null, options: { fullscreen: false } });
   let melondsOk = $state(false);
   let message = $state("");
   // Jaquettes en cache : code du jeu vers URL affichable
@@ -27,6 +44,19 @@
 
   const errText = (e: unknown) => (typeof e === "string" ? e : String(e));
   const label = (g: Game) => g.custom_title ?? g.db_title ?? g.title;
+
+  // Recherche (sans accents ni casse) et tri, calculés dans le frontend
+  let search = $state("");
+  let sort: "title" | "recent" = $state("title");
+  const norm = (s: string) => s.normalize("NFD").replace(/\p{Diacritic}/gu, "").toLowerCase();
+
+  let shown = $derived.by(() => {
+    const q = norm(search.trim());
+    const list = q ? games.filter((g) => norm(label(g)).includes(q) || norm(g.code).includes(q)) : [...games];
+    // La liste arrive déjà triée par titre ; le tri est stable
+    if (sort === "recent") list.sort((a, b) => (b.last_played ?? 0) - (a.last_played ?? 0));
+    return list;
+  });
 
   function startEdit(g: Game) {
     draft = label(g);
@@ -69,6 +99,103 @@
       message = "Dossier melonDS enregistré.";
     } catch (e) {
       melondsOk = false;
+      message = errText(e);
+    }
+  }
+
+  // Réglages de melonDS, lus et écrits dans son fichier de configuration
+  let emu: EmuConfig | null = $state(null);
+  let emuError = $state("");
+
+  // Touches du clavier : nom du bouton vers code Qt (-1 : non assignée)
+  let keys: Record<string, number> | null = $state(null);
+  // Bouton en attente d'une touche
+  let capturing: string | null = $state(null);
+
+  async function loadEmu() {
+    try {
+      emu = await invoke<EmuConfig>("get_emulator_config");
+      keys = await invoke<Record<string, number>>("get_keybindings");
+      emuError = "";
+    } catch (e) {
+      emu = null;
+      keys = null;
+      emuError = errText(e);
+    }
+  }
+
+  async function saveKeys(next: Record<string, number>) {
+    try {
+      keys = await invoke<Record<string, number>>("set_keybindings", { keys: next });
+    } catch (e) {
+      message = errText(e);
+      await loadEmu();
+    }
+  }
+
+  const keyLabel = (name: string) => KEY_ROWS.flatMap((r) => r.items).find((i) => i.name === name)?.label ?? name;
+
+  // Assigne une touche ; si elle servait déjà ailleurs, les deux boutons s'échangent
+  function assignKey(name: string, code: number) {
+    if (!keys) return;
+    const next = { ...keys };
+    const other = code < 0 ? undefined : Object.keys(next).find((n) => n !== name && next[n] === code);
+    if (other) {
+      next[other] = next[name];
+      message = `Touche échangée avec « ${keyLabel(other)} ».`;
+    } else {
+      message = "";
+    }
+    next[name] = code;
+    saveKeys(next);
+  }
+
+  function onKeyDown(e: KeyboardEvent) {
+    if (!capturing) return;
+    e.preventDefault();
+    if (e.key === "Escape") {
+      capturing = null;
+      return;
+    }
+    const code = toQt(e);
+    if (code === null) {
+      message = "Cette touche n'est pas prise en charge.";
+      return;
+    }
+    const name = capturing;
+    capturing = null;
+    assignKey(name, code);
+  }
+
+  async function saveEmu() {
+    if (!emu) return;
+    try {
+      emu = await invoke<EmuConfig>("set_emulator_config", { config: { ...emu } });
+      message = "";
+    } catch (e) {
+      message = errText(e);
+      await loadEmu();
+    }
+  }
+
+  // Recharge les réglages à chaque ouverture de la vue Réglages
+  $effect(() => {
+    if (view === "settings" && melondsOk) loadEmu();
+  });
+
+  async function saveOptions() {
+    try {
+      await invoke("set_launch_options", { options: { ...settings.options } });
+    } catch (e) {
+      message = errText(e);
+    }
+  }
+
+  async function openEmulator() {
+    message = "";
+    try {
+      await invoke("open_emulator");
+    } catch (e) {
       message = errText(e);
     }
   }
@@ -117,11 +244,14 @@
     message = "";
     try {
       await invoke("launch_game", { path: g.path });
+      games = await invoke<Game[]>("list_games");
     } catch (e) {
       message = errText(e);
     }
   }
 </script>
+
+<svelte:window onkeydown={onKeyDown} />
 
 <main>
   <nav>
@@ -135,12 +265,21 @@
     <div class="bar">
       <button onclick={addFiles}>Ajouter des jeux</button>
       <button onclick={addFolder}>Ajouter un dossier</button>
+      {#if games.length > 0}
+        <input class="search" type="search" placeholder="Rechercher" bind:value={search} />
+        <select bind:value={sort} aria-label="Tri">
+          <option value="title">Titre (A-Z)</option>
+          <option value="recent">Dernier lancé</option>
+        </select>
+      {/if}
     </div>
     {#if games.length === 0}
       <p class="empty">Aucun jeu. Ajoutez des fichiers .nds.</p>
+    {:else if shown.length === 0}
+      <p class="empty">Aucun résultat.</p>
     {:else}
       <ul class="grid">
-        {#each games as g (g.path)}
+        {#each shown as g (g.path)}
           <li class="card">
             <button
               class="box"
@@ -181,6 +320,105 @@
     <p>Dossier : <code>{settings.melonds_dir ?? "non défini"}</code></p>
     <p class={melondsOk ? "ok" : "ko"}>{melondsOk ? "Exécutable trouvé." : "Exécutable introuvable."}</p>
     <button onclick={chooseMelonDir}>Choisir le dossier</button>
+
+    <h2>Lancement</h2>
+    <label class="opt">
+      <input type="checkbox" bind:checked={settings.options.fullscreen} onchange={saveOptions} />
+      Plein écran
+    </label>
+    <button onclick={openEmulator} disabled={!melondsOk}>Ouvrir melonDS pour le configurer</button>
+
+    {#if melondsOk}
+      <h2>Réglages de melonDS</h2>
+      {#if emuError}
+        <p class="ko">{emuError}</p>
+      {:else if emu}
+        <h3>Écrans</h3>
+        <label class="opt">
+          Disposition
+          <select bind:value={emu.screen_layout} onchange={saveEmu}>
+            <option value={0}>Naturelle</option>
+            <option value={1}>Verticale (haut et bas)</option>
+            <option value={2}>Horizontale (côte à côte)</option>
+            <option value={3}>Hybride (un grand écran)</option>
+          </select>
+        </label>
+        <label class="opt"><input type="checkbox" bind:checked={emu.screen_swap} onchange={saveEmu} /> Échanger les deux écrans</label>
+        <label class="opt"><input type="checkbox" bind:checked={emu.integer_scaling} onchange={saveEmu} /> Agrandissement sans flou (multiples entiers)</label>
+        <label class="opt"><input type="checkbox" bind:checked={emu.screen_filter} onchange={saveEmu} /> Adoucir l'image</label>
+
+        <h3>Performances</h3>
+        <label class="opt">
+          Rendu 3D
+          <select bind:value={emu.fast_renderer} onchange={saveEmu}>
+            <option value={false}>Compatible (logiciel)</option>
+            <option value={true}>Rapide (OpenGL)</option>
+          </select>
+        </label>
+        <label class="opt"><input type="checkbox" bind:checked={emu.jit} onchange={saveEmu} /> Accélération JIT</label>
+        <p class="hint">Rend l'émulation bien plus rapide. À désactiver si un jeu plante.</p>
+        <label class="opt"><input type="checkbox" bind:checked={emu.limit_fps} onchange={saveEmu} /> Limiter à la vitesse normale (60 images par seconde)</label>
+        <label class="opt">
+          Vitesse de l'avance rapide
+          <input type="range" min="100" max="1000" step="25" bind:value={emu.fast_forward} onchange={saveEmu} />
+          {emu.fast_forward} %
+        </label>
+        <p class="hint">
+          S'applique tant que la touche d'avance rapide est enfoncée. 100 % est la vitesse normale ; si ton ordinateur ne suit
+          pas, la vitesse reste limitée par sa puissance.
+        </p>
+        <label class="opt"><input type="checkbox" bind:checked={emu.pause_on_blur} onchange={saveEmu} /> Mettre en pause quand la fenêtre perd le focus</label>
+
+        <h3>Audio et langue</h3>
+        <label class="opt">
+          Volume
+          <input type="range" min="0" max="100" bind:value={emu.volume} onchange={saveEmu} />
+          {emu.volume} %
+        </label>
+        <label class="opt">
+          Langue des jeux
+          <select bind:value={emu.language} onchange={saveEmu}>
+            <option value={1}>Anglais</option>
+            <option value={2}>Français</option>
+            <option value={3}>Allemand</option>
+            <option value={4}>Italien</option>
+            <option value={5}>Espagnol</option>
+            <option value={0}>Japonais</option>
+          </select>
+        </label>
+        <p class="hint">Les jeux disponibles en plusieurs langues utilisent celle-ci.</p>
+
+        {#if keys}
+          <h2>Touches du clavier</h2>
+          <p class="hint">
+            Clique sur un bouton puis appuie sur la touche voulue (Échap annule). Pour la manette, utilise « Ouvrir melonDS pour
+            le configurer ».
+          </p>
+          {#each KEY_ROWS as group}
+            <h3>{group.title}</h3>
+            <div class="keys">
+              {#each group.items as it}
+                <span class="klabel">{it.label}</span>
+                <span class="kctl">
+                  <button class="kbtn" class:wait={capturing === it.name} onclick={() => (capturing = it.name)}>
+                    {capturing === it.name ? "Appuie sur une touche…" : qtName(keys[it.name] ?? -1)}
+                  </button>
+                  <button class="kclr" title="Désassigner" onclick={() => assignKey(it.name, -1)} disabled={(keys[it.name] ?? -1) < 0}>×</button>
+                </span>
+              {/each}
+            </div>
+          {/each}
+          <button class="kreset" onclick={() => saveKeys({ ...SUGGESTED })}>Valeurs conseillées</button>
+        {/if}
+
+        <h3>Démarrage</h3>
+        <label class="opt"><input type="checkbox" bind:checked={emu.direct_boot} onchange={saveEmu} /> Lancer directement le jeu</label>
+        <p class="hint">
+          Saute le menu de la console. Décoché, melonDS démarre via le firmware, un fichier de ta propre console que VemuZ ne
+          fournit pas.
+        </p>
+      {/if}
+    {/if}
   {/if}
 </main>
 
@@ -197,8 +435,23 @@
   nav,
   .bar {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-bottom: 12px;
+  }
+  .search,
+  select {
+    background: #2d2d34;
+    color: inherit;
+    border: 1px solid #3c3c46;
+    border-radius: 4px;
+    padding: 6px 10px;
+    font: inherit;
+  }
+  .search {
+    flex: 1;
+    min-width: 120px;
+    max-width: 260px;
   }
   button {
     background: #2d2d34;
@@ -298,6 +551,46 @@
   }
   .card:hover .act {
     display: block;
+  }
+  .opt {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .keys {
+    display: grid;
+    grid-template-columns: max-content max-content;
+    gap: 6px 16px;
+    align-items: center;
+  }
+  .kctl {
+    display: flex;
+    gap: 4px;
+  }
+  .kbtn {
+    min-width: 170px;
+    text-align: left;
+  }
+  .kbtn.wait {
+    border-color: #ffd479;
+    color: #ffd479;
+  }
+  .kclr {
+    padding: 0 8px;
+  }
+  .kreset {
+    margin-top: 12px;
+  }
+  h3 {
+    margin: 16px 0 8px;
+    font-size: 1rem;
+    opacity: 0.85;
+  }
+  .hint {
+    opacity: 0.6;
+    font-size: 0.85rem;
+    margin: 0 0 8px;
   }
   .msg {
     color: #ffd479;

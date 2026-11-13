@@ -1,10 +1,11 @@
 mod covers;
 mod emulator;
+mod melonds_config;
 mod rom;
 mod storage;
 mod titles;
 
-use emulator::{Emulator, MelonDs};
+use emulator::{Emulator, LaunchOptions, MelonDs};
 use rom::Game;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -18,6 +19,8 @@ const GAMES_FILE: &str = "games.json";
 #[derive(Serialize, Deserialize, Default, Clone)]
 struct Settings {
     melonds_dir: Option<String>,
+    #[serde(default)]
+    options: LaunchOptions,
 }
 
 #[derive(Default)]
@@ -46,6 +49,61 @@ fn set_melonds_dir(app: AppHandle, state: State<AppState>, dir: String) -> Resul
     settings.melonds_dir = Some(dir);
     storage::save(&app, SETTINGS_FILE, &*settings)?;
     Ok(settings.clone())
+}
+
+/// Mémorise les options de lancement (plein écran, mode de démarrage).
+#[tauri::command]
+fn set_launch_options(app: AppHandle, state: State<AppState>, options: LaunchOptions) -> Result<Settings, String> {
+    let mut settings = state.settings.lock().unwrap();
+    settings.options = options;
+    storage::save(&app, SETTINGS_FILE, &*settings)?;
+    Ok(settings.clone())
+}
+
+fn config_file(state: &AppState) -> Result<PathBuf, String> {
+    let dir = state.settings.lock().unwrap().melonds_dir.clone().ok_or("Dossier melonDS non configuré.")?;
+    melonds_config::config_path(Path::new(&dir)).ok_or_else(|| {
+        "Configuration de melonDS introuvable : ouvre melonDS une fois, puis ferme-le pour qu'il la crée.".to_string()
+    })
+}
+
+/// Lit les réglages simplifiés dans le fichier de configuration de melonDS.
+#[tauri::command]
+fn get_emulator_config(state: State<AppState>) -> Result<melonds_config::EmuConfig, String> {
+    melonds_config::read(&config_file(&state)?)
+}
+
+/// Écrit les réglages dans melonDS.toml. Refusé pendant que melonDS tourne : il réécrit son fichier en se fermant.
+#[tauri::command]
+fn set_emulator_config(
+    state: State<AppState>,
+    config: melonds_config::EmuConfig,
+) -> Result<melonds_config::EmuConfig, String> {
+    if state.running.load(Ordering::SeqCst) {
+        return Err("Ferme melonDS avant de modifier ses réglages.".into());
+    }
+    let path = config_file(&state)?;
+    melonds_config::write(&path, &config)?;
+    melonds_config::read(&path)
+}
+
+/// Touches du clavier configurées dans melonDS (codes Qt, -1 si non assignée).
+#[tauri::command]
+fn get_keybindings(state: State<AppState>) -> Result<std::collections::HashMap<String, i64>, String> {
+    melonds_config::read_keys(&config_file(&state)?)
+}
+
+#[tauri::command]
+fn set_keybindings(
+    state: State<AppState>,
+    keys: std::collections::HashMap<String, i64>,
+) -> Result<std::collections::HashMap<String, i64>, String> {
+    if state.running.load(Ordering::SeqCst) {
+        return Err("Ferme melonDS avant de modifier ses réglages.".into());
+    }
+    let path = config_file(&state)?;
+    melonds_config::write_keys(&path, &keys)?;
+    melonds_config::read_keys(&path)
 }
 
 /// Indique si le dossier mémorisé contient toujours l'exécutable.
@@ -147,12 +205,25 @@ fn remove_game(app: AppHandle, state: State<AppState>, path: String) -> Result<V
 /// Lance la ROM, réduit la fenêtre, et la restaure quand l'émulateur se ferme.
 #[tauri::command]
 fn launch_game(app: AppHandle, state: State<AppState>, path: String) -> Result<(), String> {
+    run_emulator(app, &state, Some(path))
+}
+
+/// Ouvre melonDS sans jeu, pour régler les manettes, les écrans ou les BIOS dans l'émulateur.
+#[tauri::command]
+fn open_emulator(app: AppHandle, state: State<AppState>) -> Result<(), String> {
+    run_emulator(app, &state, None)
+}
+
+fn run_emulator(app: AppHandle, state: &AppState, rom: Option<String>) -> Result<(), String> {
     if state.running.swap(true, Ordering::SeqCst) {
         return Err("Un jeu est déjà en cours.".into());
     }
-    let dir = state.settings.lock().unwrap().melonds_dir.clone();
+    let (dir, options) = {
+        let s = state.settings.lock().unwrap();
+        (s.melonds_dir.clone(), s.options.clone())
+    };
     let child = match dir {
-        Some(d) => MelonDs.launch(Path::new(&d), Path::new(&path)),
+        Some(d) => MelonDs.launch(Path::new(&d), rom.as_deref().map(Path::new), &options),
         None => Err("Dossier melonDS non configuré (voir Réglages).".into()),
     };
     let mut child = match child {
@@ -162,6 +233,19 @@ fn launch_game(app: AppHandle, state: State<AppState>, path: String) -> Result<(
             return Err(e);
         }
     };
+
+    // Mémorise la date de lancement pour le tri "dernier lancé"
+    if let Some(path) = &rom {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|d| d.as_secs());
+        let mut games = state.games.lock().unwrap();
+        if let Some(g) = games.iter_mut().find(|g| same_path(&g.path, path)) {
+            g.last_played = now;
+        }
+        let _ = storage::save(&app, GAMES_FILE, &*games);
+    }
 
     let window = app.get_webview_window("main");
     if let Some(w) = &window {
@@ -197,6 +281,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_settings,
             set_melonds_dir,
+            set_launch_options,
+            get_emulator_config,
+            set_emulator_config,
+            get_keybindings,
+            set_keybindings,
+            open_emulator,
             melonds_ok,
             list_games,
             list_covers,
