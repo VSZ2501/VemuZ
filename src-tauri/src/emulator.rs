@@ -1,16 +1,74 @@
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+//! Interface commune à tous les émulateurs et registre des connecteurs.
 
-/// Options communes de lancement, mémorisées par VemuZ.
+use crate::desmume::DeSmuME;
+use crate::melonds::MelonDs;
+use crate::saves::SaveLayout;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::Child;
+
+/// Options communes de lancement, mémorisées par VemuZ pour chaque émulateur.
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct LaunchOptions {
     #[serde(default)]
     pub fullscreen: bool,
 }
 
+/// Valeurs des réglages d'un émulateur, par identifiant de réglage.
+pub type Values = serde_json::Map<String, serde_json::Value>;
+
+/// Un réglage déclaré par un connecteur, affiché tel quel par l'interface.
+#[derive(Serialize)]
+pub struct SettingDef {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub help: Option<&'static str>,
+    /// Titre de la section des Réglages
+    pub group: &'static str,
+    /// Réglage pointu, rangé dans la section Avancé repliée
+    pub advanced: bool,
+    #[serde(flatten)]
+    pub kind: Kind,
+}
+
+/// Ensemble de valeurs appliqué en un clic (Conseillé, Performance, Qualité).
+#[derive(Serialize)]
+pub struct Preset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub help: &'static str,
+    /// Seuls ces réglages changent
+    pub values: Values,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Kind {
+    Toggle,
+    /// Liste de choix : (valeur, libellé), dans l'ordre d'affichage
+    Choice { options: Vec<(serde_json::Value, &'static str)> },
+    Range { min: i64, max: i64, step: i64, unit: &'static str },
+}
+
+/// Touches du clavier ou boutons de la manette.
+#[derive(Deserialize, Clone, Copy)]
+#[serde(rename_all = "lowercase")]
+pub enum Binding {
+    Keyboard,
+    Pad,
+}
+
+pub type Bindings = HashMap<String, i64>;
+
 /// Interface commune à tous les émulateurs. Un connecteur par émulateur.
-pub trait Emulator {
+pub trait Emulator: Sync {
+    /// Identifiant stable, utilisé dans settings.json
+    fn id(&self) -> &'static str;
+    fn name(&self) -> &'static str;
+    /// Console émulée (identifiant de consoles.ts)
+    fn console(&self) -> &'static str;
+
     /// Chemin de l'exécutable dans le dossier d'installation, s'il existe.
     fn executable(&self, dir: &Path) -> Option<PathBuf>;
     /// Lance l'émulateur, avec une ROM ou seul (pour qu'il soit configuré à la main).
@@ -36,11 +94,51 @@ pub trait Emulator {
         subs.sort();
         subs.into_iter().find(|p| self.executable(p).is_some())
     }
+
+    /// Réglages proposés dans VemuZ, dans l'ordre d'affichage.
+    fn settings_schema(&self) -> Vec<SettingDef>;
+    /// Préréglages proposés, le premier étant le conseillé.
+    fn presets(&self) -> Vec<Preset> {
+        Vec::new()
+    }
+    fn read_settings(&self, dir: &Path) -> Result<Values, String>;
+    /// Écrit les réglages puis renvoie les valeurs relues.
+    fn write_settings(&self, dir: &Path, values: &Values) -> Result<Values, String>;
+
+    /// Format des codes de touches, pour que l'interface sache les capturer et les afficher.
+    /// None : touches non réglables dans VemuZ.
+    fn bindings_format(&self) -> Option<&'static str> {
+        None
+    }
+    fn read_bindings(&self, _dir: &Path, _kind: Binding) -> Result<Bindings, String> {
+        Err(format!("Les touches de {} ne se règlent pas encore dans VemuZ.", self.name()))
+    }
+    /// Écrit les touches puis renvoie les valeurs relues.
+    fn write_bindings(&self, _dir: &Path, _kind: Binding, _keys: &Bindings) -> Result<Bindings, String> {
+        Err(format!("Les touches de {} ne se règlent pas encore dans VemuZ.", self.name()))
+    }
+
+    /// Dossiers et extensions des sauvegardes de l'émulateur installé dans `dir`.
+    fn save_layout(&self, dir: &Path) -> SaveLayout;
+}
+
+/// Tous les connecteurs. Pour chaque console, le premier listé est l'émulateur conseillé.
+pub fn all() -> &'static [&'static dyn Emulator] {
+    &[&MelonDs, &DeSmuME]
+}
+
+pub fn by_id(id: &str) -> Option<&'static dyn Emulator> {
+    all().iter().copied().find(|e| e.id() == id)
+}
+
+/// Émulateur conseillé pour une console.
+pub fn recommended(console: &str) -> Option<&'static dyn Emulator> {
+    all().iter().copied().find(|e| e.console() == console)
 }
 
 /// Cherche, dans chaque dossier de base, les sous-dossiers dont le nom commence par `prefix`
 /// et qui contiennent l'émulateur. Sans doublon, dans l'ordre des bases.
-fn scan(emu: &dyn Emulator, bases: &[PathBuf], prefix: &str) -> Vec<PathBuf> {
+pub fn scan(emu: &dyn Emulator, bases: &[PathBuf], prefix: &str) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     for base in bases {
         let Ok(entries) = std::fs::read_dir(base) else { continue };
@@ -68,7 +166,7 @@ fn scan(emu: &dyn Emulator, bases: &[PathBuf], prefix: &str) -> Vec<PathBuf> {
 }
 
 /// Dossiers où l'utilisateur range habituellement un émulateur téléchargé.
-fn usual_bases() -> Vec<PathBuf> {
+pub fn usual_bases() -> Vec<PathBuf> {
     let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
     let mut bases = Vec::new();
     if let Some(home) = env("USERPROFILE") {
@@ -88,45 +186,6 @@ fn usual_bases() -> Vec<PathBuf> {
     bases.extend(env("ProgramFiles(x86)"));
     bases.push(PathBuf::from(format!("{}\\", std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into()))));
     bases
-}
-
-pub struct MelonDs;
-
-impl MelonDs {
-    #[cfg(windows)]
-    const EXE: &'static str = "melonDS.exe";
-    #[cfg(not(windows))]
-    const EXE: &'static str = "melonDS";
-}
-
-impl Emulator for MelonDs {
-    fn executable(&self, dir: &Path) -> Option<PathBuf> {
-        let exe = dir.join(Self::EXE);
-        exe.is_file().then_some(exe)
-    }
-
-    fn launch(&self, dir: &Path, rom: Option<&Path>, options: &LaunchOptions) -> Result<Child, String> {
-        let exe = self
-            .executable(dir)
-            .ok_or_else(|| format!("{} introuvable dans {}", Self::EXE, dir.display()))?;
-        let mut cmd = Command::new(exe);
-        cmd.current_dir(dir);
-        if options.fullscreen {
-            cmd.arg("-f");
-        }
-        if let Some(rom) = rom {
-            cmd.arg(rom);
-        }
-        cmd.spawn().map_err(|e| format!("Lancement impossible : {e}"))
-    }
-
-    fn detect(&self) -> Vec<PathBuf> {
-        scan(self, &usual_bases(), "melonds")
-    }
-
-    fn download_url(&self) -> Option<&'static str> {
-        Some("https://melonds.kuribo64.net/downloads.php")
-    }
 }
 
 #[cfg(test)]
@@ -169,5 +228,29 @@ mod tests {
 
         assert_eq!(r, Some(inner));
         assert_eq!(none, None);
+    }
+
+    #[test]
+    fn registre_coherent() {
+        let mut ids: Vec<&str> = all().iter().map(|e| e.id()).collect();
+        let n = ids.len();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), n, "identifiants uniques");
+        assert_eq!(recommended("ds").map(|e| e.id()), Some("melonds"));
+        // Chaque réglage déclaré a une valeur lisible et des identifiants uniques
+        for e in all() {
+            let schema = e.settings_schema();
+            let mut sids: Vec<&str> = schema.iter().map(|s| s.id).collect();
+            sids.sort();
+            sids.dedup();
+            assert_eq!(sids.len(), schema.len(), "réglages uniques pour {}", e.id());
+            // Un préréglage ne touche que des réglages déclarés
+            for p in e.presets() {
+                for k in p.values.keys() {
+                    assert!(sids.contains(&k.as_str()), "{} : {k} absent du schéma", p.id);
+                }
+            }
+        }
     }
 }

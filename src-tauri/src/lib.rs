@@ -1,15 +1,19 @@
 mod archive;
 mod covers;
+mod desmume;
 mod emulator;
+mod ini;
+mod melonds;
 mod melonds_config;
 mod rom;
 mod saves;
 mod storage;
 mod titles;
 
-use emulator::{Emulator, LaunchOptions, MelonDs};
+use emulator::{Binding, Bindings, Emulator, LaunchOptions, Preset, SettingDef, Values};
 use rom::Game;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -23,11 +27,27 @@ use tauri::{
 const SETTINGS_FILE: &str = "settings.json";
 const GAMES_FILE: &str = "games.json";
 
+/// Ce que VemuZ retient d'un émulateur.
 #[derive(Serialize, Deserialize, Default, Clone)]
-struct Settings {
-    melonds_dir: Option<String>,
+struct EmuEntry {
+    dir: Option<String>,
     #[serde(default)]
     options: LaunchOptions,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct Settings {
+    /// Par identifiant d'émulateur
+    #[serde(default)]
+    emulators: HashMap<String, EmuEntry>,
+    /// Émulateur choisi pour chaque console (absent : le conseillé)
+    #[serde(default)]
+    consoles: HashMap<String, String>,
+    /// Ancien format (V1.0), repris dans `emulators` au chargement
+    #[serde(default, skip_serializing)]
+    melonds_dir: Option<String>,
+    #[serde(default, skip_serializing)]
+    options: Option<LaunchOptions>,
     /// Taille des jaquettes : "s", "m" ou "l" (vide : moyenne)
     #[serde(default)]
     cover_size: String,
@@ -40,6 +60,33 @@ struct Settings {
     /// Vrai : la fenêtre est seulement réduite pendant un jeu (sinon fermée pour libérer la mémoire)
     #[serde(default)]
     keep_window: bool,
+}
+
+impl Settings {
+    /// Reprend les réglages de la V1.0 (un seul émulateur). Vrai si quelque chose a changé.
+    fn migrate(&mut self) -> bool {
+        let (dir, options) = (self.melonds_dir.take(), self.options.take());
+        if dir.is_none() && options.is_none() {
+            return false;
+        }
+        let e = self.emulators.entry("melonds".into()).or_default();
+        if e.dir.is_none() {
+            e.dir = dir;
+        }
+        if let Some(o) = options {
+            e.options = o;
+        }
+        true
+    }
+
+    /// Émulateur utilisé pour une console : celui choisi, sinon le conseillé.
+    fn emulator_for(&self, console: &str) -> Option<&'static dyn Emulator> {
+        self.consoles.get(console).and_then(|id| emulator::by_id(id)).or_else(|| emulator::recommended(console))
+    }
+
+    fn dir_of(&self, emu: &dyn Emulator) -> Option<PathBuf> {
+        self.emulators.get(emu.id()).and_then(|e| e.dir.as_deref()).map(PathBuf::from)
+    }
 }
 
 /// Vue à rouvrir quand la fenêtre est recréée après un jeu.
@@ -75,25 +122,180 @@ fn get_settings(state: State<AppState>) -> Settings {
     state.settings.lock().unwrap().clone()
 }
 
-/// Vérifie que l'exécutable melonDS est dans le dossier (ou un sous-dossier direct), puis mémorise le chemin.
-#[tauri::command]
-fn set_melonds_dir(app: AppHandle, state: State<AppState>, dir: String) -> Result<Settings, String> {
-    let dir = MelonDs
-        .resolve_dir(Path::new(&dir))
-        .ok_or("melonDS.exe introuvable dans ce dossier. Choisis le dossier qui contient melonDS.exe.")?;
-    let mut settings = state.settings.lock().unwrap();
-    settings.melonds_dir = Some(dir.to_string_lossy().into_owned());
-    storage::save(&app, SETTINGS_FILE, &*settings)?;
-    Ok(settings.clone())
+// ---------- Émulateurs ----------
+
+/// Un émulateur tel que l'interface le présente.
+#[derive(Serialize)]
+struct EmuInfo {
+    id: &'static str,
+    name: &'static str,
+    console: &'static str,
+    recommended: bool,
+    /// Utilisé pour sa console
+    selected: bool,
+    dir: Option<String>,
+    /// L'exécutable est bien dans le dossier mémorisé
+    ok: bool,
+    options: LaunchOptions,
+    download: bool,
+    bindings: Option<&'static str>,
 }
 
-/// Mémorise les options de lancement (plein écran, mode de démarrage).
+fn emu_infos(s: &Settings) -> Vec<EmuInfo> {
+    emulator::all()
+        .iter()
+        .map(|e| {
+            let entry = s.emulators.get(e.id()).cloned().unwrap_or_default();
+            EmuInfo {
+                id: e.id(),
+                name: e.name(),
+                console: e.console(),
+                recommended: emulator::recommended(e.console()).is_some_and(|r| r.id() == e.id()),
+                selected: s.emulator_for(e.console()).is_some_and(|r| r.id() == e.id()),
+                ok: entry.dir.as_deref().is_some_and(|d| e.executable(Path::new(d)).is_some()),
+                dir: entry.dir,
+                options: entry.options,
+                download: e.download_url().is_some(),
+                bindings: e.bindings_format(),
+            }
+        })
+        .collect()
+}
+
+fn find_emu(id: &str) -> Result<&'static dyn Emulator, String> {
+    emulator::by_id(id).ok_or_else(|| "Émulateur inconnu.".to_string())
+}
+
 #[tauri::command]
-fn set_launch_options(app: AppHandle, state: State<AppState>, options: LaunchOptions) -> Result<Settings, String> {
+fn list_emulators(state: State<AppState>) -> Vec<EmuInfo> {
+    emu_infos(&state.settings.lock().unwrap())
+}
+
+/// Vérifie que l'exécutable est dans le dossier (ou un sous-dossier direct), puis mémorise le chemin.
+#[tauri::command]
+fn set_emulator_dir(app: AppHandle, state: State<AppState>, emu: String, dir: String) -> Result<Vec<EmuInfo>, String> {
+    let e = find_emu(&emu)?;
+    let dir = e.resolve_dir(Path::new(&dir)).ok_or_else(|| {
+        format!("{} introuvable dans ce dossier. Choisis le dossier qui contient son exécutable.", e.name())
+    })?;
     let mut settings = state.settings.lock().unwrap();
-    settings.options = options;
+    settings.emulators.entry(emu).or_default().dir = Some(dir.to_string_lossy().into_owned());
     storage::save(&app, SETTINGS_FILE, &*settings)?;
-    Ok(settings.clone())
+    Ok(emu_infos(&settings))
+}
+
+/// Mémorise les options de lancement d'un émulateur (plein écran).
+#[tauri::command]
+fn set_launch_options(
+    app: AppHandle,
+    state: State<AppState>,
+    emu: String,
+    options: LaunchOptions,
+) -> Result<Vec<EmuInfo>, String> {
+    find_emu(&emu)?;
+    let mut settings = state.settings.lock().unwrap();
+    settings.emulators.entry(emu).or_default().options = options;
+    storage::save(&app, SETTINGS_FILE, &*settings)?;
+    Ok(emu_infos(&settings))
+}
+
+/// Choisit l'émulateur utilisé pour une console.
+#[tauri::command]
+fn set_console_emulator(
+    app: AppHandle,
+    state: State<AppState>,
+    console: String,
+    emu: String,
+) -> Result<Vec<EmuInfo>, String> {
+    if find_emu(&emu)?.console() != console {
+        return Err("Cet émulateur ne prend pas en charge cette console.".into());
+    }
+    let mut settings = state.settings.lock().unwrap();
+    settings.consoles.insert(console, emu);
+    storage::save(&app, SETTINGS_FILE, &*settings)?;
+    Ok(emu_infos(&settings))
+}
+
+/// Dossier d'un émulateur configuré, ou une erreur lisible.
+fn emu_dir(state: &AppState, e: &dyn Emulator) -> Result<PathBuf, String> {
+    state.settings.lock().unwrap().dir_of(e).ok_or_else(|| format!("Dossier de {} non configuré.", e.name()))
+}
+
+/// Refuse une écriture pendant un jeu : l'émulateur réécrit souvent sa configuration en se fermant.
+fn not_running(state: &AppState, e: &dyn Emulator) -> Result<(), String> {
+    if state.running.load(Ordering::SeqCst) {
+        return Err(format!("Ferme {} avant de modifier ses réglages.", e.name()));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct EmuSettings {
+    schema: Vec<SettingDef>,
+    presets: Vec<Preset>,
+    values: Values,
+}
+
+/// Réglages déclarés par le connecteur et valeurs lues dans la configuration de l'émulateur.
+#[tauri::command]
+fn get_emulator_settings(state: State<AppState>, emu: String) -> Result<EmuSettings, String> {
+    let e = find_emu(&emu)?;
+    let values = e.read_settings(&emu_dir(&state, e)?)?;
+    Ok(EmuSettings { schema: e.settings_schema(), presets: e.presets(), values })
+}
+
+#[tauri::command]
+fn set_emulator_settings(state: State<AppState>, emu: String, values: Values) -> Result<Values, String> {
+    let e = find_emu(&emu)?;
+    not_running(&state, e)?;
+    e.write_settings(&emu_dir(&state, e)?, &values)
+}
+
+/// Touches du clavier ou boutons de la manette (-1 si non assigné).
+#[tauri::command]
+fn get_bindings(state: State<AppState>, emu: String, kind: Binding) -> Result<Bindings, String> {
+    let e = find_emu(&emu)?;
+    e.read_bindings(&emu_dir(&state, e)?, kind)
+}
+
+#[tauri::command]
+fn set_bindings(state: State<AppState>, emu: String, kind: Binding, keys: Bindings) -> Result<Bindings, String> {
+    let e = find_emu(&emu)?;
+    not_running(&state, e)?;
+    e.write_bindings(&emu_dir(&state, e)?, kind, &keys)
+}
+
+/// Un dossier où un émulateur semble installé.
+#[derive(Serialize)]
+struct Found {
+    emu: &'static str,
+    name: &'static str,
+    dir: String,
+}
+
+/// Émulateurs d'une console trouvés sur la machine, le conseillé en premier.
+#[tauri::command]
+async fn detect_emulators(console: String) -> Vec<Found> {
+    emulator::all()
+        .iter()
+        .filter(|e| e.console() == console)
+        .flat_map(|e| {
+            e.detect()
+                .into_iter()
+                .map(|d| Found { emu: e.id(), name: e.name(), dir: d.to_string_lossy().into_owned() })
+        })
+        .collect()
+}
+
+/// Ouvre la page officielle de téléchargement dans le navigateur. L'adresse est fixée dans le code.
+#[tauri::command]
+fn open_download_page(emu: String) -> Result<(), String> {
+    let url = find_emu(&emu)?.download_url().ok_or("Aucune page de téléchargement connue.")?;
+    std::process::Command::new("explorer")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Impossible d'ouvrir le navigateur : {e}"))
 }
 
 /// Mémorise la taille des jaquettes de la bibliothèque.
@@ -208,100 +410,6 @@ fn set_theme(app: AppHandle, state: State<AppState>, theme: String) -> Result<Se
     Ok(settings.clone())
 }
 
-fn config_file(state: &AppState) -> Result<PathBuf, String> {
-    let dir = state.settings.lock().unwrap().melonds_dir.clone().ok_or("Dossier melonDS non configuré.")?;
-    melonds_config::config_path(Path::new(&dir)).ok_or_else(|| {
-        "Configuration de melonDS introuvable : ouvre melonDS une fois, puis ferme-le pour qu'il la crée.".to_string()
-    })
-}
-
-/// Lit les réglages simplifiés dans le fichier de configuration de melonDS.
-#[tauri::command]
-fn get_emulator_config(state: State<AppState>) -> Result<melonds_config::EmuConfig, String> {
-    melonds_config::read(&config_file(&state)?)
-}
-
-/// Écrit les réglages dans melonDS.toml. Refusé pendant que melonDS tourne : il réécrit son fichier en se fermant.
-#[tauri::command]
-fn set_emulator_config(
-    state: State<AppState>,
-    config: melonds_config::EmuConfig,
-) -> Result<melonds_config::EmuConfig, String> {
-    if state.running.load(Ordering::SeqCst) {
-        return Err("Ferme melonDS avant de modifier ses réglages.".into());
-    }
-    let path = config_file(&state)?;
-    melonds_config::write(&path, &config)?;
-    melonds_config::read(&path)
-}
-
-/// Touches du clavier configurées dans melonDS (codes Qt, -1 si non assignée).
-#[tauri::command]
-fn get_keybindings(state: State<AppState>) -> Result<std::collections::HashMap<String, i64>, String> {
-    melonds_config::read_keys(&config_file(&state)?)
-}
-
-#[tauri::command]
-fn set_keybindings(
-    state: State<AppState>,
-    keys: std::collections::HashMap<String, i64>,
-) -> Result<std::collections::HashMap<String, i64>, String> {
-    if state.running.load(Ordering::SeqCst) {
-        return Err("Ferme melonDS avant de modifier ses réglages.".into());
-    }
-    let path = config_file(&state)?;
-    melonds_config::write_keys(&path, &keys)?;
-    melonds_config::read_keys(&path)
-}
-
-/// Boutons de la manette configurés dans melonDS (codes SDL, -1 si non assigné).
-#[tauri::command]
-fn get_joybindings(state: State<AppState>) -> Result<std::collections::HashMap<String, i64>, String> {
-    melonds_config::read_joy(&config_file(&state)?)
-}
-
-#[tauri::command]
-fn set_joybindings(
-    state: State<AppState>,
-    keys: std::collections::HashMap<String, i64>,
-) -> Result<std::collections::HashMap<String, i64>, String> {
-    if state.running.load(Ordering::SeqCst) {
-        return Err("Ferme melonDS avant de modifier ses réglages.".into());
-    }
-    let path = config_file(&state)?;
-    melonds_config::write_joy(&path, &keys)?;
-    melonds_config::read_joy(&path)
-}
-
-/// Indique si le dossier mémorisé contient toujours l'exécutable.
-#[tauri::command]
-fn melonds_ok(state: State<AppState>) -> bool {
-    state
-        .settings
-        .lock()
-        .unwrap()
-        .melonds_dir
-        .as_deref()
-        .is_some_and(|d| MelonDs.executable(Path::new(d)).is_some())
-}
-
-/// Dossiers où melonDS semble installé, pour le premier lancement.
-#[tauri::command]
-fn detect_emulator() -> Vec<String> {
-    MelonDs.detect().iter().map(|p| p.to_string_lossy().into_owned()).collect()
-}
-
-/// Ouvre la page officielle de téléchargement dans le navigateur. L'adresse est fixée dans le code.
-#[tauri::command]
-fn open_download_page() -> Result<(), String> {
-    let url = MelonDs.download_url().ok_or("Aucune page de téléchargement connue.")?;
-    std::process::Command::new("explorer")
-        .arg(url)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("Impossible d'ouvrir le navigateur : {e}"))
-}
-
 // ---------- Bibliothèque ----------
 
 #[tauri::command]
@@ -403,19 +511,31 @@ fn remove_game(app: AppHandle, state: State<AppState>, path: String) -> Result<V
 
 // ---------- Sauvegardes ----------
 
-/// Où trouver les sauvegardes d'un jeu : (fichier .sav, dossier des sauvegardes rapides, dossier des copies).
+/// Où trouver les sauvegardes d'un jeu : fichier de sauvegarde, rangement de l'émulateur, dossier des copies.
 struct SaveCtx {
     save: Option<PathBuf>,
-    states: Option<PathBuf>,
+    layout: saves::SaveLayout,
     backups: PathBuf,
 }
 
+/// Console d'un jeu. Seule la DS est prise en charge pour l'instant.
+fn game_console(_game: &str) -> &'static str {
+    "ds"
+}
+
+/// Émulateur utilisé pour un jeu et son dossier, s'il est configuré.
+fn game_emulator(state: &AppState, game: &str) -> Option<(&'static dyn Emulator, Option<PathBuf>)> {
+    let s = state.settings.lock().unwrap();
+    let e = s.emulator_for(game_console(game))?;
+    Some((e, s.dir_of(e)))
+}
+
 fn save_ctx(app: &AppHandle, state: &AppState, game: &str) -> Result<SaveCtx, String> {
-    let melonds = state.settings.lock().unwrap().melonds_dir.clone().map(PathBuf::from);
-    let (save_dir, state_dir) = melonds
-        .as_deref()
-        .and_then(|d| melonds_config::config_path(d).map(|c| melonds_config::asset_dirs(&c, d)))
-        .unwrap_or((None, None));
+    let layout = match game_emulator(state, game) {
+        Some((e, Some(dir))) => e.save_layout(&dir),
+        // Aucun émulateur configuré : convention de melonDS, à côté de la ROM
+        _ => saves::SaveLayout { save_dir: None, state_dir: None, save_ext: "sav", state_ext: "ml" },
+    };
     let code = state
         .games
         .lock()
@@ -426,8 +546,8 @@ fn save_ctx(app: &AppHandle, state: &AppState, game: &str) -> Result<SaveCtx, St
         .unwrap_or_default();
     let game = Path::new(game);
     Ok(SaveCtx {
-        save: saves::save_file(game, save_dir.as_deref()),
-        states: state_dir,
+        save: saves::save_file(game, &layout),
+        layout,
         backups: backups_root(app)?.join(saves::backup_key(&code, game)),
     })
 }
@@ -449,7 +569,7 @@ fn auto_backup(app: &AppHandle, game: &str) {
 #[tauri::command]
 fn get_saves(app: AppHandle, state: State<AppState>, path: String) -> Result<saves::SaveInfo, String> {
     let ctx = save_ctx(&app, &state, &path)?;
-    Ok(saves::get(Path::new(&path), ctx.save.as_deref().and_then(Path::parent), ctx.states.as_deref(), &ctx.backups))
+    Ok(saves::get(Path::new(&path), &ctx.layout, &ctx.backups))
 }
 
 #[tauri::command]
@@ -486,7 +606,7 @@ fn export_all_saves(app: AppHandle, state: State<AppState>, dest: String) -> Res
 #[tauri::command]
 fn restore_backup(app: AppHandle, state: State<AppState>, path: String, id: String) -> Result<saves::SaveInfo, String> {
     if state.running.load(Ordering::SeqCst) {
-        return Err("Ferme melonDS avant de restaurer une sauvegarde.".into());
+        return Err("Ferme l'émulateur avant de restaurer une sauvegarde.".into());
     }
     let ctx = save_ctx(&app, &state, &path)?;
     let save = ctx.save.as_deref().ok_or("Emplacement de la sauvegarde inconnu pour ce jeu.")?;
@@ -528,31 +648,33 @@ fn show_in_explorer(path: String) -> Result<(), String> {
 /// Lance la ROM, réduit la fenêtre, et la restaure quand l'émulateur se ferme.
 #[tauri::command]
 fn launch_game(app: AppHandle, state: State<AppState>, path: String) -> Result<(), String> {
-    run_emulator(app, &state, Some(path))
+    let e = game_emulator(&state, &path).ok_or("Aucun émulateur pour ce jeu.")?.0;
+    run_emulator(app, &state, e, Some(path))
 }
 
-/// Ouvre melonDS sans jeu, pour régler les manettes, les écrans ou les BIOS dans l'émulateur.
+/// Ouvre un émulateur sans jeu, pour régler les manettes, les écrans ou les BIOS directement dans l'émulateur.
 #[tauri::command]
-fn open_emulator(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    run_emulator(app, &state, None)
+fn open_emulator(app: AppHandle, state: State<AppState>, emu: String) -> Result<(), String> {
+    run_emulator(app, &state, find_emu(&emu)?, None)
 }
 
-/// Lance melonDS. Le frontend met ensuite VemuZ en veille (`sleep_window`).
-fn run_emulator(app: AppHandle, state: &AppState, rom: Option<String>) -> Result<(), String> {
+/// Lance l'émulateur. Le frontend met ensuite VemuZ en veille (`sleep_window`).
+fn run_emulator(app: AppHandle, state: &AppState, emu: &'static dyn Emulator, rom: Option<String>) -> Result<(), String> {
     if state.running.swap(true, Ordering::SeqCst) {
         return Err("Un jeu est déjà en cours.".into());
     }
     let (dir, options) = {
         let s = state.settings.lock().unwrap();
-        (s.melonds_dir.clone(), s.options.clone())
+        let entry = s.emulators.get(emu.id()).cloned().unwrap_or_default();
+        (entry.dir, entry.options)
     };
     // Copie de sécurité avant de jouer
     if let Some(r) = &rom {
         auto_backup(&app, r);
     }
     let child = match dir {
-        Some(d) => MelonDs.launch(Path::new(&d), rom.as_deref().map(Path::new), &options),
-        None => Err("Dossier melonDS non configuré (voir Réglages).".into()),
+        Some(d) => emu.launch(Path::new(&d), rom.as_deref().map(Path::new), &options),
+        None => Err(format!("Dossier de {} non configuré (voir Réglages).", emu.name())),
     };
     let mut child = match child {
         Ok(c) => c,
@@ -578,7 +700,7 @@ fn run_emulator(app: AppHandle, state: &AppState, rom: Option<String>) -> Result
     let started = std::time::Instant::now();
     std::thread::spawn(move || {
         let _ = child.wait();
-        // Temps de jeu de la partie, compté à la fermeture de melonDS
+        // Temps de jeu de la partie, compté à la fermeture de l'émulateur
         if let Some(r) = &rom {
             let state = app.state::<AppState>();
             let mut games = state.games.lock().unwrap();
@@ -609,7 +731,11 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle();
             let state = app.state::<AppState>();
-            *state.settings.lock().unwrap() = storage::load(handle, SETTINGS_FILE);
+            let mut settings: Settings = storage::load(handle, SETTINGS_FILE);
+            if settings.migrate() {
+                let _ = storage::save(handle, SETTINGS_FILE, &settings);
+            }
+            *state.settings.lock().unwrap() = settings;
             *state.games.lock().unwrap() = storage::load(handle, GAMES_FILE);
             covers::start(handle);
             tray(app)?;
@@ -625,23 +751,22 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
-            set_melonds_dir,
+            list_emulators,
+            set_emulator_dir,
             set_launch_options,
+            set_console_emulator,
+            get_emulator_settings,
+            set_emulator_settings,
+            get_bindings,
+            set_bindings,
+            detect_emulators,
             set_cover_size,
             set_theme,
             set_pad_directions,
             sleep_window,
             get_resume,
             set_keep_window,
-            get_emulator_config,
-            set_emulator_config,
-            get_keybindings,
-            set_keybindings,
-            get_joybindings,
-            set_joybindings,
             open_emulator,
-            melonds_ok,
-            detect_emulator,
             open_download_page,
             list_games,
             list_covers,
@@ -694,4 +819,23 @@ fn tray(app: &tauri::App) -> tauri::Result<()> {
     }
     tray.build(app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reprend_les_reglages_de_la_v1_0() {
+        let old = r#"{"melonds_dir":"C:/melonDS","options":{"fullscreen":true},"theme":"light"}"#;
+        let mut s: Settings = serde_json::from_str(old).unwrap();
+        assert!(s.migrate());
+        let e = &s.emulators["melonds"];
+        assert_eq!((e.dir.as_deref(), e.options.fullscreen), (Some("C:/melonDS"), true));
+        assert_eq!(s.emulator_for("ds").map(|e| e.id()), Some("melonds"));
+        // L'ancien format n'est plus écrit
+        let out = serde_json::to_string(&s).unwrap();
+        assert!(!out.contains("melonds_dir") && out.contains("\"theme\":\"light\""));
+        assert!(!s.migrate(), "rien à reprendre la deuxième fois");
+    }
 }

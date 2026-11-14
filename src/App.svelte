@@ -4,14 +4,15 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { onMount, tick } from "svelte";
-  import { KEY_ROWS, SUGGESTED, qtName, toQt } from "./keys";
+  import { KEY_ROWS } from "./keys";
+  import { CODECS } from "./bindings";
   import logoDark from "./assets/vemuz-logo.svg";
   import logoLight from "./assets/vemuz-logo-clair.svg";
   import { applyTheme, type Theme } from "./theme";
   import { detectFranchise, OTHERS } from "./franchises";
   import { fadeIn, pause, slide, withViewTransition } from "./motion";
   import { CONSOLES } from "./consoles";
-  import { PAD_TYPE_LABEL, padType, readPad, sdlName, suggested as padSuggested, toSdl, type Directions, type PadType } from "./padmap";
+  import { PAD_TYPE_LABEL, padType, readPad, type Directions, type PadType } from "./padmap";
   import { nearest, startGamepad, type PadAction } from "./gamepad";
 
   type Game = {
@@ -27,33 +28,50 @@
   };
   type LaunchOptions = { fullscreen: boolean };
   type Settings = {
-    melonds_dir: string | null;
-    options: LaunchOptions;
     cover_size?: string;
     theme?: string;
     pad_directions?: string;
     keep_window?: boolean;
   };
-  type EmuConfig = {
-    screen_layout: number;
-    screen_swap: boolean;
-    integer_scaling: boolean;
-    screen_filter: boolean;
-    fast_renderer: boolean;
-    limit_fps: boolean;
-    jit: boolean;
-    volume: number;
-    language: number;
-    direct_boot: boolean;
-    pause_on_blur: boolean;
-    fast_forward: number;
+  // Émulateur tel que le backend le décrit
+  type EmuInfo = {
+    id: string;
+    name: string;
+    console: string;
+    recommended: boolean;
+    selected: boolean;
+    dir: string | null;
+    ok: boolean;
+    options: LaunchOptions;
+    download: boolean;
+    bindings: string | null;
   };
+  // Réglage déclaré par un connecteur
+  type SettingDef = {
+    id: string;
+    label: string;
+    help: string | null;
+    group: string;
+    advanced: boolean;
+    type: "toggle" | "choice" | "range";
+    options?: [unknown, string][];
+    min?: number;
+    max?: number;
+    step?: number;
+    unit?: string;
+  };
+  type Preset = { id: string; label: string; help: string; values: Record<string, unknown> };
+  type Found = { emu: string; name: string; dir: string };
 
   type Tab = "consoles" | "library" | "settings";
-  let view: "welcome" | Tab = $state("consoles");
+  let view: Tab = $state("consoles");
   let games: Game[] = $state([]);
-  let settings: Settings = $state({ melonds_dir: null, options: { fullscreen: false } });
-  let melondsOk = $state(false);
+  let settings: Settings = $state({});
+  let emus: EmuInfo[] = $state([]);
+  // Émulateur utilisé pour la DS (seule console jouable pour l'instant)
+  let dsEmu = $derived(emus.find((e) => e.console === "ds" && e.selected) ?? emus.find((e) => e.console === "ds"));
+  let dsId = $derived(dsEmu?.id);
+  let emuReady = $derived(!!dsEmu?.ok);
   let message = $state("");
   // Jaquettes en cache : code du jeu vers URL affichable
   let covers: Record<string, string> = $state({});
@@ -227,20 +245,15 @@
   onMount(async () => {
     settings = await invoke<Settings>("get_settings");
     if (settings.theme === "dark" || settings.theme === "light" || settings.theme === "system") theme = settings.theme;
-    melondsOk = await invoke<boolean>("melonds_ok");
+    emus = await invoke<EmuInfo[]>("list_emulators");
     games = await invoke<Game[]>("list_games");
-    if (!melondsOk) {
-      view = "welcome";
-      detect();
-    } else {
-      // Fenêtre recréée après un jeu : retour sur la vue d'avant, jeu lancé sélectionné
-      const resume = await invoke<{ view: string; game: string | null } | null>("get_resume");
-      if (resume && (resume.view === "consoles" || resume.view === "library" || resume.view === "settings")) {
-        view = resume.view;
-        if (resume.game) {
-          await tick();
-          document.querySelector<HTMLElement>(`.card[data-path="${CSS.escape(resume.game)}"] > .box`)?.focus();
-        }
+    // Fenêtre recréée après un jeu : retour sur la vue d'avant, jeu lancé sélectionné
+    const resume = await invoke<{ view: string; game: string | null } | null>("get_resume");
+    if (resume && (resume.view === "consoles" || resume.view === "library" || resume.view === "settings")) {
+      view = resume.view;
+      if (resume.game) {
+        await tick();
+        document.querySelector<HTMLElement>(`.card[data-path="${CSS.escape(resume.game)}"] > .box`)?.focus();
       }
     }
 
@@ -253,77 +266,140 @@
     await listen("games-updated", async () => (games = await invoke<Game[]>("list_games")));
   });
 
-  // Premier lancement : dossiers où melonDS semble installé
-  let found: string[] = $state([]);
+  // Dossiers où les émulateurs d'une console semblent installés (panneau de configuration)
+  let found: Found[] = $state([]);
   let detecting = $state(false);
 
-  async function detect() {
+  async function detect(console: string) {
     detecting = true;
     try {
-      found = await invoke<string[]>("detect_emulator");
+      found = await invoke<Found[]>("detect_emulators", { console });
     } finally {
       detecting = false;
     }
   }
 
-  async function openDownload() {
+  async function openDownload(emu: string) {
     try {
-      await invoke("open_download_page");
+      await invoke("open_download_page", { emu });
     } catch (e) {
       message = errText(e);
     }
   }
 
-  async function chooseMelonDir() {
-    const dir = await open({ directory: true, title: "Dossier de melonDS" });
-    if (typeof dir === "string") await useDir(dir);
+  async function chooseEmuDir(e: EmuInfo | undefined = dsEmu) {
+    if (!e) return;
+    const { id, name } = e;
+    const dir = await open({ directory: true, title: `Dossier de ${name}` });
+    if (typeof dir === "string") await useDir(id, dir);
   }
 
-  async function useDir(dir: string) {
+  async function useDir(emu: string, dir: string) {
     try {
-      settings = await invoke<Settings>("set_melonds_dir", { dir });
-      melondsOk = true;
-      if (view === "welcome") {
-        view = "library";
-        message = "melonDS est prêt. Ajoute maintenant tes jeux.";
+      emus = await invoke<EmuInfo[]>("set_emulator_dir", { emu, dir });
+      const info = emus.find((e) => e.id === emu);
+      const name = info?.name ?? "L'émulateur";
+      if (setup) {
+        // Depuis le panneau : cet émulateur devient celui de la console, puis la bibliothèque s'ouvre
+        if (info && !info.selected) emus = await invoke<EmuInfo[]>("set_console_emulator", { console: setup, emu });
+        setup = null;
+        message = `${name} est prêt. Ajoute maintenant tes jeux.`;
+        go("library");
       } else {
-        message = "Dossier melonDS enregistré.";
+        message = `Dossier de ${name} enregistré.`;
       }
     } catch (e) {
-      melondsOk = false;
       message = errText(e);
     }
   }
 
-  // Réglages de melonDS, lus et écrits dans son fichier de configuration
-  let emu: EmuConfig | null = $state(null);
+  // Réglages de l'émulateur : déclarés par son connecteur, lus et écrits dans son fichier de configuration
+  let schema = $state<SettingDef[] | null>(null);
+  let vals: Record<string, any> = $state({});
   let emuError = $state("");
+  let presets: Preset[] = $state([]);
+  let showAdvanced = $state(false);
+  // Réglages courants regroupés par section, dans l'ordre déclaré ; les avancés à part
+  let emuGroups = $derived.by(() => {
+    const list: SettingDef[] = (schema ?? []).filter((s) => !s.advanced);
+    return [...new Set(list.map((s) => s.group))].map((g) => ({ title: g, items: list.filter((s) => s.group === g) }));
+  });
+  let advItems = $derived((schema ?? []).filter((s) => s.advanced));
+  // Préréglage dont toutes les valeurs correspondent aux réglages actuels
+  let activePreset = $derived(presets.find((p) => Object.entries(p.values).every(([k, v]) => vals[k] === v))?.id);
+  let dsEmus = $derived(emus.filter((e) => e.console === "ds"));
+
+  async function applyPreset(p: Preset) {
+    if (!dsId) return;
+    try {
+      vals = await invoke<Record<string, any>>("set_emulator_settings", { emu: dsId, values: p.values });
+      message = "";
+    } catch (e) {
+      message = errText(e);
+    }
+  }
+
+  async function chooseEmulator(console: string, emu: string) {
+    try {
+      emus = await invoke<EmuInfo[]>("set_console_emulator", { console, emu });
+    } catch (e) {
+      message = errText(e);
+    }
+  }
 
   // Touches du clavier : nom du bouton vers code Qt (-1 : non assignée)
   let keys: Record<string, number> | null = $state(null);
   // Bouton en attente d'une touche
   let capturing: string | null = $state(null);
 
-  async function loadEmu() {
+  async function loadEmu(emu: string) {
     try {
-      emu = await invoke<EmuConfig>("get_emulator_config");
-      keys = await invoke<Record<string, number>>("get_keybindings");
-      joy = await invoke<Record<string, number>>("get_joybindings");
+      const r = await invoke<{ schema: SettingDef[]; presets: Preset[]; values: Record<string, any> }>(
+        "get_emulator_settings",
+        { emu },
+      );
+      schema = r.schema;
+      presets = r.presets;
+      vals = r.values;
+      // Capture et affichage des touches : seul le format de melonDS est connu pour l'instant
+      const fmt = emus.find((e) => e.id === emu)?.bindings;
+      if (fmt && CODECS[fmt]) {
+        keys = await invoke<Record<string, number>>("get_bindings", { emu, kind: "keyboard" });
+        joy = await invoke<Record<string, number>>("get_bindings", { emu, kind: "pad" });
+      } else {
+        keys = null;
+        joy = null;
+      }
       emuError = "";
     } catch (e) {
-      emu = null;
+      schema = null;
       keys = null;
       joy = null;
       emuError = errText(e);
     }
   }
 
+  // Format des touches de l'émulateur choisi (capture, noms, valeurs conseillées)
+  let codec = $derived(dsEmu?.bindings ? CODECS[dsEmu.bindings] : undefined);
+  // Boutons et raccourcis réglables dans cet émulateur, dans l'ordre d'affichage
+  const rowsFor = (map: Record<string, number>) =>
+    KEY_ROWS.map((g) => ({ ...g, items: g.items.filter((i) => i.name in map) })).filter((g) => g.items.length > 0);
+
+  // Clavier et manette dans le même emplacement : un côté modifié change l'autre
+  async function refreshShared(kind: "keyboard" | "pad") {
+    if (!codec?.shared || !dsId) return;
+    const other = await invoke<Record<string, number>>("get_bindings", { emu: dsId, kind });
+    if (kind === "keyboard") keys = other;
+    else joy = other;
+  }
+
   async function saveKeys(next: Record<string, number>) {
     try {
-      keys = await invoke<Record<string, number>>("set_keybindings", { keys: next });
+      keys = await invoke<Record<string, number>>("set_bindings", { emu: dsEmu?.id, kind: "keyboard", keys: next });
+      await refreshShared("pad");
     } catch (e) {
       message = errText(e);
-      await loadEmu();
+      await reloadEmu();
     }
   }
 
@@ -344,9 +420,9 @@
     saveKeys(next);
   }
 
-  // ---------- Manette dans melonDS ----------
+  // ---------- Manette dans l'émulateur ----------
 
-  // Boutons de la manette dans melonDS : nom du bouton DS vers code SDL (-1 : non assigné)
+  // Boutons de la manette dans l'émulateur : nom du bouton DS vers code de l'émulateur (-1 : non assigné)
   let joy: Record<string, number> | null = $state(null);
   // Bouton DS en attente d'un appui sur la manette
   let padCapturing: string | null = $state(null);
@@ -354,6 +430,9 @@
   let padDirs = $derived<Directions>(
     settings.pad_directions === "dpad" || settings.pad_directions === "stick" ? settings.pad_directions : "both",
   );
+
+  // Sans touche combinée (DeSmuME), « Les deux » revient à la croix
+  let dpadOn = $derived(padDirs === "dpad" || (padDirs === "both" && !codec?.bothDirections));
 
   async function setPadDirs(d: Directions) {
     settings.pad_directions = d;
@@ -382,10 +461,11 @@
 
   async function saveJoy(next: Record<string, number>) {
     try {
-      joy = await invoke<Record<string, number>>("set_joybindings", { keys: next });
+      joy = await invoke<Record<string, number>>("set_bindings", { emu: dsEmu?.id, kind: "pad", keys: next });
+      await refreshShared("keyboard");
     } catch (e) {
       message = errText(e);
-      await loadEmu();
+      await reloadEmu();
     }
   }
 
@@ -424,7 +504,7 @@
       else if (released) {
         const kind = padType(r.id);
         padKind = kind;
-        const code = toSdl(kind, r.pressed[0]);
+        const code = codec ? codec.padFromInput(kind, r.pressed[0]) : null;
         padCapturing = null;
         if (code === null) message = "Ce bouton n'est pas pris en charge.";
         else assignJoy(name, code);
@@ -445,13 +525,17 @@
       closeSheet();
       return;
     }
+    if (setup && e.key === "Escape") {
+      closeSetup();
+      return;
+    }
     if (!capturing) return;
     e.preventDefault();
     if (e.key === "Escape") {
       capturing = null;
       return;
     }
-    const code = toQt(e);
+    const code = codec ? codec.keyFromEvent(e) : null;
     if (code === null) {
       message = "Cette touche n'est pas prise en charge.";
       return;
@@ -461,25 +545,30 @@
     assignKey(name, code);
   }
 
+  async function reloadEmu() {
+    if (dsId) await loadEmu(dsId);
+  }
+
   async function saveEmu() {
-    if (!emu) return;
+    if (!schema || !dsId) return;
     try {
-      emu = await invoke<EmuConfig>("set_emulator_config", { config: { ...emu } });
+      vals = await invoke<Record<string, any>>("set_emulator_settings", { emu: dsId, values: { ...vals } });
       message = "";
     } catch (e) {
       message = errText(e);
-      await loadEmu();
+      await reloadEmu();
     }
   }
 
-  // Recharge les réglages à chaque ouverture de la vue Réglages
+  // Recharge les réglages à chaque ouverture de la vue Réglages (ou changement d'émulateur)
   $effect(() => {
-    if (view === "settings" && melondsOk) loadEmu();
+    if (view === "settings" && emuReady && dsId) loadEmu(dsId);
   });
 
-  async function saveOptions() {
+  async function saveFullscreen(fullscreen: boolean) {
+    if (!dsId) return;
     try {
-      await invoke("set_launch_options", { options: { ...settings.options } });
+      emus = await invoke<EmuInfo[]>("set_launch_options", { emu: dsId, options: { fullscreen } });
     } catch (e) {
       message = errText(e);
     }
@@ -496,7 +585,7 @@
   async function openEmulator() {
     message = "";
     try {
-      await invoke("open_emulator");
+      await invoke("open_emulator", { emu: dsId });
       await invoke("sleep_window", { view, game: null });
     } catch (e) {
       message = errText(e);
@@ -722,14 +811,59 @@
   let selectedId = $state("ds");
   let selected = $derived(CONSOLES.find((c) => c.id === selectedId) ?? CONSOLES[0]);
 
+  // Émulateur utilisé pour une console : celui choisi, sinon le premier (conseillé)
+  const consoleEmu = (id: string) => emus.find((e) => e.console === id && e.selected) ?? emus.find((e) => e.console === id);
+
+  // ready : jouable ; setup : aucun émulateur indiqué ; lost : dossier disparu ; soon : pas encore prise en charge
+  function consoleState(id: string): "ready" | "setup" | "lost" | "soon" {
+    const e = consoleEmu(id);
+    if (!e) return "soon";
+    if (e.ok) return "ready";
+    return e.dir ? "lost" : "setup";
+  }
+
   function openConsole(id: string) {
     selectedId = id;
-    const c = CONSOLES.find((x) => x.id === id);
-    if (c?.emulator) {
+    const state = consoleState(id);
+    if (state === "ready") {
       go("library");
-    } else {
+    } else if (state === "soon") {
+      const c = CONSOLES.find((x) => x.id === id);
       message = `${c?.name ?? "Cette console"} arrivera avec un prochain émulateur.`;
+    } else {
+      openSetup(id);
     }
+  }
+
+  // Panneau de configuration d'une console
+  let setup: string | null = $state(null);
+  // Émulateur affiché dans le panneau (null : celui de la console)
+  let setupEmuId: string | null = $state(null);
+  let setupConsole = $derived(CONSOLES.find((c) => c.id === setup));
+  let setupEmus = $derived(emus.filter((e) => e.console === setup));
+  let setupEmu = $derived(setupEmus.find((e) => e.id === setupEmuId) ?? (setup ? consoleEmu(setup) : undefined));
+  let setupFound = $derived(found.filter((f) => f.emu === setupEmu?.id));
+
+  async function openSetup(id: string) {
+    setup = id;
+    setupEmuId = null;
+    found = [];
+    detect(id).then(() => {
+      // Rien d'indiqué encore : on montre d'abord un émulateur déjà installé, même s'il n'est pas le conseillé
+      if (setup === id && setupEmuId === null && !consoleEmu(id)?.dir && setupFound.length === 0 && found.length > 0) {
+        setupEmuId = found[0].emu;
+      }
+    });
+    await tick();
+    if (padMode) focusEl(document.querySelector<HTMLElement>(".sheet button.primary, .sheet button"));
+  }
+
+  async function closeSetup() {
+    const id = setup;
+    setup = null;
+    await tick();
+    // Rend la sélection à la tuile de la console
+    if (padMode && view === "consoles" && id) focusEl(document.querySelector<HTMLElement>(".tile.on"));
   }
 
   // ---------- Manette (mode salon) ----------
@@ -747,8 +881,8 @@
 
   // Éléments atteignables : visibles et actifs, hors boutons de survol des jaquettes
   function focusables(): HTMLElement[] {
-    // Fiche ouverte : la sélection reste dedans
-    const root = sheet ? document.querySelector(".sheet") : document;
+    // Fiche ou panneau ouvert : la sélection reste dedans
+    const root = sheet || setup ? document.querySelector(".sheet") : document;
     if (!root) return [];
     const all = root.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled)");
     return [...all].filter((el) => !el.closest(".acts") && el.getClientRects().length > 0 && getComputedStyle(el).visibility !== "hidden");
@@ -806,7 +940,7 @@
   }
 
   async function switchView(next: Tab) {
-    if (view === "welcome" || view === next) return;
+    if (view === next) return;
     await go(next);
     await tick();
     focusFirst();
@@ -821,6 +955,7 @@
     if (a === "back") {
       if (confirming) confirming = null;
       else if (sheet) closeSheet();
+      else if (setup) closeSetup();
       else if (capturing) capturing = null;
       else if (editing) editing = null;
       else if (view === "settings") switchView("library");
@@ -831,20 +966,18 @@
     if (editing || capturing) return;
 
     if (a === "details") {
-      if (!sheet && known && cur.classList.contains("box")) {
+      if (!sheet && !setup && known && cur.classList.contains("box")) {
         const path = cur.closest<HTMLElement>(".card")?.dataset.path;
         const g = games.find((x) => x.path === path);
         if (g) openSheet(g);
       }
       return;
     }
-    if (sheet && (a === "prev" || a === "next" || a === "search")) return;
+    if ((sheet || setup) && (a === "prev" || a === "next" || a === "search")) return;
 
     if (a === "prev" || a === "next") {
-      if (view !== "welcome") {
-        const i = TAB_ORDER.indexOf(view) + (a === "next" ? 1 : -1);
-        switchView(TAB_ORDER[(i + TAB_ORDER.length) % TAB_ORDER.length]);
-      }
+      const i = TAB_ORDER.indexOf(view) + (a === "next" ? 1 : -1);
+      switchView(TAB_ORDER[(i + TAB_ORDER.length) % TAB_ORDER.length]);
     } else if (a === "search") {
       const input = document.querySelector<HTMLInputElement>(".search input");
       if (input) focusEl(input);
@@ -925,6 +1058,25 @@
   }
 </script>
 
+<!-- Une ligne de réglage d'émulateur, selon son type -->
+{#snippet settingRow(s: SettingDef)}
+  <label class="row">
+    <span class="lbl">{s.label}{#if s.help}<small>{s.help}</small>{/if}</span>
+    {#if s.type === "toggle"}
+      <input type="checkbox" bind:checked={vals[s.id]} onchange={saveEmu} />
+    {:else if s.type === "choice"}
+      <select bind:value={vals[s.id]} onchange={saveEmu}>
+        {#each s.options ?? [] as [v, l]}<option value={v}>{l}</option>{/each}
+      </select>
+    {:else}
+      <span class="range">
+        <input type="range" min={s.min} max={s.max} step={s.step} bind:value={vals[s.id]} onchange={saveEmu} />
+        <span class="val">{vals[s.id]} {s.unit}</span>
+      </span>
+    {/if}
+  </label>
+{/snippet}
+
 {#snippet card(g: Game, i: number)}
   <li class="card" class:launched={launching === g.path && !!ghost} data-path={g.path} style:--i={Math.min(i, 18)}>
     <button
@@ -932,7 +1084,7 @@
       onclick={() => launch(g)}
       onmousemove={tilt}
       onmouseleave={untilt}
-      disabled={!melondsOk}
+      disabled={!emuReady}
       title="{g.code}&#10;{g.path}"
     >
       {#if covers[g.code]}
@@ -991,14 +1143,12 @@
     <img src={logo} alt="" width="30" height="30" />
     <span>VemuZ</span>
   </div>
-  {#if view !== "welcome"}
   <nav>
     <span class="tab-pill" style:left="{pill.left}px" style:width="{pill.width}px" aria-hidden="true"></span>
     <button class="tab" class:active={view === "consoles"} bind:this={tabEls.consoles} onclick={() => go("consoles")}>Consoles</button>
     <button class="tab" class:active={view === "library"} bind:this={tabEls.library} onclick={() => go("library")}>Bibliothèque</button>
     <button class="tab" class:active={view === "settings"} bind:this={tabEls.settings} onclick={() => go("settings")}>Réglages</button>
   </nav>
-  {/if}
 </header>
 
 <main>
@@ -1011,57 +1161,7 @@
     </div>
   {/if}
 
-  {#if view === "welcome"}
-    <div class="welcome">
-      <h1>Bienvenue dans VemuZ</h1>
-      <p class="lead">
-        Pour jouer à tes jeux Nintendo DS, VemuZ s'appuie sur melonDS, un émulateur gratuit et open source que tu
-        installes toi-même.
-      </p>
-      {#if settings.melonds_dir}
-        <p class="status ko">
-          <span class="dot"></span>melonDS n'est plus dans <code>{settings.melonds_dir}</code>.
-        </p>
-      {/if}
-
-      {#if detecting}
-        <p class="hint">Recherche de melonDS sur ton ordinateur…</p>
-      {:else if found.length > 0}
-        <h2>{found.length > 1 ? "melonDS est installé à plusieurs endroits" : "melonDS est déjà installé"}</h2>
-        <ul class="found">
-          {#each found as d, i}
-            <li>
-              <code>{d}</code>
-              <button class:primary={i === 0} onclick={() => useDir(d)}>Utiliser ce dossier</button>
-            </li>
-          {/each}
-        </ul>
-        <p class="hint">{found.length > 1 ? "Aucun ne convient ?" : "Ce n'est pas le bon ?"} <button class="link" onclick={chooseMelonDir}>Choisis un autre dossier</button>.</p>
-      {:else}
-        <h2>Installer melonDS</h2>
-        <ol class="steps">
-          <li>
-            <span>Télécharge la version Windows sur le site officiel de melonDS.</span>
-            <button class="primary" onclick={openDownload}>Ouvrir le site de melonDS</button>
-          </li>
-          <li>
-            <span>Décompresse le fichier zip dans un dossier, par exemple <code>Documents\melonDS</code>.</span>
-          </li>
-          <li>
-            <span>Indique ce dossier à VemuZ.</span>
-            <span class="step-acts">
-              <button onclick={detect}>Rechercher à nouveau</button>
-              <button onclick={chooseMelonDir}>Choisir le dossier</button>
-            </span>
-          </li>
-        </ol>
-      {/if}
-
-      <p class="legal">
-        VemuZ ne fournit ni jeux, ni BIOS, ni firmware. melonDS lance les jeux sans BIOS grâce au démarrage direct.
-      </p>
-    </div>
-  {:else if view === "consoles"}
+  {#if view === "consoles"}
     <div class="home">
       <div class="home-head">
         {#key selected.id}
@@ -1069,8 +1169,12 @@
         {/key}
         <p class="home-sub">
           Sortie en {selected.year}.
-          {#if selected.emulator}
-            Jouable avec {selected.emulator}, {games.length} {games.length > 1 ? "jeux" : "jeu"} dans ta bibliothèque.
+          {#if consoleState(selected.id) === "ready"}
+            Jouable avec {consoleEmu(selected.id)?.name}, {games.length} {games.length > 1 ? "jeux" : "jeu"} dans ta bibliothèque.
+          {:else if consoleState(selected.id) === "lost"}
+            {consoleEmu(selected.id)?.name} est introuvable dans son dossier : ouvre la console pour le retrouver.
+          {:else if consoleState(selected.id) === "setup"}
+            Ouvre la console pour choisir un émulateur et commencer à jouer.
           {:else}
             Prise en charge prévue avec un prochain émulateur.
           {/if}
@@ -1082,14 +1186,20 @@
             <button
               class="tile"
               class:on={c.id === selectedId}
-              class:soon={!c.emulator}
+              class:soon={consoleState(c.id) === "soon"}
               onmouseenter={() => (selectedId = c.id)}
               onfocus={() => (selectedId = c.id)}
               onclick={() => openConsole(c.id)}
             >
               <svg class="tile-art" viewBox="0 0 64 48" aria-hidden="true">{@html c.draw}</svg>
               <span class="tile-name">{c.name}</span>
-              <span class="tile-state">{c.emulator ? `${games.length} ${games.length > 1 ? "jeux" : "jeu"}` : "Bientôt"}</span>
+              {#if consoleState(c.id) === "ready"}
+                <span class="tile-state">{games.length} {games.length > 1 ? "jeux" : "jeu"}</span>
+              {:else if consoleState(c.id) === "soon"}
+                <span class="tile-state">Bientôt</span>
+              {:else}
+                <span class="tile-state todo">{consoleState(c.id) === "lost" ? "Émulateur introuvable" : "À configurer"}</span>
+              {/if}
             </button>
           </li>
         {/each}
@@ -1149,10 +1259,12 @@
         </div>
       </div>
 
-      {#if !melondsOk}
+      {#if !emuReady}
         <p class="note">
-          Indique le dossier de melonDS pour lancer un jeu.
-          <button onclick={() => go("settings")}>Ouvrir les réglages</button>
+          {consoleState("ds") === "lost"
+            ? `${dsEmu?.name} est introuvable : retrouve son dossier pour lancer un jeu.`
+            : "Choisis un émulateur pour lancer tes jeux."}
+          <button onclick={() => openSetup("ds")}>Configurer</button>
         </p>
       {/if}
 
@@ -1169,7 +1281,7 @@
             <span class="soft">Dernière partie, {fmtAgo(resume.last_played ?? 0)}</span>
             <span class="resume-title">{label(resume)}</span>
           </div>
-          <button class="primary resume-play" onclick={() => resume && launch(resume)} disabled={!melondsOk}>Reprendre</button>
+          <button class="primary resume-play" onclick={() => resume && launch(resume)} disabled={!emuReady}>Reprendre</button>
         </div>
       {/if}
 
@@ -1206,19 +1318,30 @@
       <h1>Réglages</h1>
 
       <section>
-        <h2>melonDS</h2>
+        <h2>Nintendo DS</h2>
         <div class="rows">
+          <label class="row">
+            <span class="lbl">
+              Émulateur
+              <small>Celui qui lance tes jeux DS. Ses réglages s'affichent plus bas.</small>
+            </span>
+            <select value={dsId} onchange={(e) => chooseEmulator("ds", e.currentTarget.value)}>
+              {#each dsEmus as e (e.id)}
+                <option value={e.id}>{e.name}{e.recommended ? " (conseillé)" : ""}</option>
+              {/each}
+            </select>
+          </label>
           <div class="row">
             <span class="lbl">
               Dossier
-              <small><code>{settings.melonds_dir ?? "non défini"}</code></small>
+              <small><code>{dsEmu?.dir ?? "non défini"}</code></small>
             </span>
-            <button onclick={chooseMelonDir}>Choisir le dossier</button>
+            <button onclick={() => chooseEmuDir()}>Choisir le dossier</button>
           </div>
-          <p class="status" class:ok={melondsOk} class:ko={!melondsOk}>
-            <span class="dot"></span>{melondsOk
+          <p class="status" class:ok={emuReady} class:ko={!emuReady}>
+            <span class="dot"></span>{emuReady
               ? "Exécutable trouvé"
-              : "Exécutable introuvable : choisis le dossier qui contient melonDS.exe."}
+              : `Exécutable introuvable : choisis le dossier de ${dsEmu?.name ?? "l'émulateur"}.`}
           </p>
         </div>
       </section>
@@ -1228,20 +1351,24 @@
         <div class="rows">
           <label class="row">
             <span class="lbl">Plein écran</span>
-            <input type="checkbox" bind:checked={settings.options.fullscreen} onchange={saveOptions} />
+            <input
+              type="checkbox"
+              checked={dsEmu?.options.fullscreen ?? false}
+              onchange={(e) => saveFullscreen(e.currentTarget.checked)}
+            />
           </label>
           <div class="row">
             <span class="lbl">
               Configuration avancée
-              <small>Ouvre melonDS seul, par exemple pour régler une manette.</small>
+              <small>Ouvre {dsEmu?.name ?? "l'émulateur"} seul, par exemple pour régler une manette.</small>
             </span>
-            <button onclick={openEmulator} disabled={!melondsOk}>Ouvrir melonDS</button>
+            <button onclick={openEmulator} disabled={!emuReady}>Ouvrir {dsEmu?.name ?? "l'émulateur"}</button>
           </div>
           <label class="row">
             <span class="lbl">
               Libérer la mémoire pendant le jeu
               <small>
-                VemuZ se ferme pendant la partie et revient quand tu quittes melonDS. Son icône près de l'horloge le rouvre
+                VemuZ se ferme pendant la partie et revient quand tu quittes l'émulateur. Son icône près de l'horloge le rouvre
                 à tout moment.
               </small>
             </span>
@@ -1287,101 +1414,43 @@
         </div>
       </section>
 
-      {#if melondsOk}
+      {#if emuReady}
         {#if emuError}
           <section>
             <h2>Émulation</h2>
             <div class="rows"><p class="status ko"><span class="dot"></span>{emuError}</p></div>
           </section>
-        {:else if emu}
-          <section>
-            <h2>Écrans</h2>
-            <div class="rows">
-              <label class="row">
-                <span class="lbl">Disposition</span>
-                <select bind:value={emu.screen_layout} onchange={saveEmu}>
-                  <option value={0}>Naturelle</option>
-                  <option value={1}>Verticale (haut et bas)</option>
-                  <option value={2}>Horizontale (côte à côte)</option>
-                  <option value={3}>Hybride (un grand écran)</option>
-                </select>
-              </label>
-              <label class="row">
-                <span class="lbl">Échanger les deux écrans</span>
-                <input type="checkbox" bind:checked={emu.screen_swap} onchange={saveEmu} />
-              </label>
-              <label class="row">
-                <span class="lbl">Agrandissement sans flou<small>Multiples entiers de la taille d'origine.</small></span>
-                <input type="checkbox" bind:checked={emu.integer_scaling} onchange={saveEmu} />
-              </label>
-              <label class="row">
-                <span class="lbl">Adoucir l'image</span>
-                <input type="checkbox" bind:checked={emu.screen_filter} onchange={saveEmu} />
-              </label>
-            </div>
-          </section>
+        {:else if schema}
+          {#if presets.length > 0}
+            <section>
+              <h2>Préréglages</h2>
+              <div class="rows">
+                <div class="row">
+                  <span class="lbl">
+                    Réglage rapide
+                    <small>{presets.find((p) => p.id === activePreset)?.help ?? "Réglages personnalisés."}</small>
+                  </span>
+                  <div class="seg" role="group" aria-label="Préréglages">
+                    {#each presets as p (p.id)}
+                      <button class:on={activePreset === p.id} aria-pressed={activePreset === p.id} onclick={() => applyPreset(p)}>
+                        {p.label}
+                      </button>
+                    {/each}
+                  </div>
+                </div>
+              </div>
+            </section>
+          {/if}
 
-          <section>
-            <h2>Performances</h2>
-            <div class="rows">
-              <label class="row">
-                <span class="lbl">Rendu 3D</span>
-                <select bind:value={emu.fast_renderer} onchange={saveEmu}>
-                  <option value={false}>Compatible (logiciel)</option>
-                  <option value={true}>Rapide (OpenGL)</option>
-                </select>
-              </label>
-              <label class="row">
-                <span class="lbl">Accélération JIT<small>Rend l'émulation bien plus rapide. À désactiver si un jeu plante.</small></span>
-                <input type="checkbox" bind:checked={emu.jit} onchange={saveEmu} />
-              </label>
-              <label class="row">
-                <span class="lbl">Limiter à la vitesse normale<small>60 images par seconde.</small></span>
-                <input type="checkbox" bind:checked={emu.limit_fps} onchange={saveEmu} />
-              </label>
-              <label class="row">
-                <span class="lbl">
-                  Vitesse de l'avance rapide
-                  <small>
-                    S'applique tant que la touche d'avance rapide est enfoncée. 100 % est la vitesse normale ; si ton
-                    ordinateur ne suit pas, la vitesse reste limitée par sa puissance.
-                  </small>
-                </span>
-                <span class="range">
-                  <input type="range" min="100" max="1000" step="25" bind:value={emu.fast_forward} onchange={saveEmu} />
-                  <span class="val">{emu.fast_forward} %</span>
-                </span>
-              </label>
-              <label class="row">
-                <span class="lbl">Mettre en pause quand la fenêtre perd le focus</span>
-                <input type="checkbox" bind:checked={emu.pause_on_blur} onchange={saveEmu} />
-              </label>
-            </div>
-          </section>
-
-          <section>
-            <h2>Audio et langue</h2>
-            <div class="rows">
-              <label class="row">
-                <span class="lbl">Volume</span>
-                <span class="range">
-                  <input type="range" min="0" max="100" bind:value={emu.volume} onchange={saveEmu} />
-                  <span class="val">{emu.volume} %</span>
-                </span>
-              </label>
-              <label class="row">
-                <span class="lbl">Langue des jeux<small>Les jeux disponibles en plusieurs langues utilisent celle-ci.</small></span>
-                <select bind:value={emu.language} onchange={saveEmu}>
-                  <option value={1}>Anglais</option>
-                  <option value={2}>Français</option>
-                  <option value={3}>Allemand</option>
-                  <option value={4}>Italien</option>
-                  <option value={5}>Espagnol</option>
-                  <option value={0}>Japonais</option>
-                </select>
-              </label>
-            </div>
-          </section>
+          <!-- Réglages déclarés par le connecteur, une section par groupe -->
+          {#each emuGroups as grp (grp.title)}
+            <section>
+              <h2>{grp.title}</h2>
+              <div class="rows">
+                {#each grp.items as s (s.id)}{@render settingRow(s)}{/each}
+              </div>
+            </section>
+          {/each}
 
           {#if keys}
             <section>
@@ -1389,15 +1458,19 @@
               <div class="rows">
                 <p class="hint">
                   Clique sur un bouton puis appuie sur la touche voulue (Échap annule).
+                  {#if codec?.shared}
+                    {dsEmu?.name} ne garde qu'une commande par bouton : choisir une touche remplace le bouton de manette.
+                  {/if}
+                  {#if codec?.keyNote}{codec.keyNote}{/if}
                 </p>
-                {#each KEY_ROWS as group}
+                {#each rowsFor(keys) as group}
                   <h3>{group.title}</h3>
                   <div class="keys">
                     {#each group.items as it}
                       <div class="krow">
                         <span class="klabel">{it.label}</span>
                         <button class="kbtn" class:wait={capturing === it.name} onclick={() => (capturing = it.name)}>
-                          {capturing === it.name ? "Appuie sur une touche…" : qtName(keys[it.name] ?? -1)}
+                          {capturing === it.name ? "Appuie sur une touche…" : codec?.keyName(keys[it.name] ?? -1)}
                         </button>
                         <button
                           class="icon"
@@ -1413,7 +1486,7 @@
                   </div>
                 {/each}
                 <div class="kreset">
-                  <button onclick={() => saveKeys({ ...SUGGESTED })}>Revenir aux valeurs conseillées</button>
+                  <button onclick={() => codec && saveKeys({ ...codec.keySuggested })}>Revenir aux valeurs conseillées</button>
                 </div>
               </div>
             </section>
@@ -1421,24 +1494,30 @@
 
           {#if joy}
             <section>
-              <h2>Manette dans melonDS</h2>
+              <h2>Manette dans {dsEmu?.name}</h2>
               <div class="rows">
                 <p class="status" class:ok={!!padKind}>
                   <span class="dot"></span>{padKind ? `${PAD_TYPE_LABEL[padKind]} détectée` : "Aucune manette détectée : branche-la et appuie sur un bouton."}
                 </p>
                 <p class="hint">
                   Clique sur un bouton de la DS, puis appuie sur le bouton voulu de ta manette ou pousse un stick (Échap
-                  annule). melonDS utilise la première manette branchée. Les numéros de boutons suivent les pilotes habituels
-                  de melonDS : vérifie une fois avec « Tester dans melonDS ».
+                  annule).
+                  {#if codec?.shared}
+                    DeSmuME ne garde qu'une commande par bouton : choisir un bouton de manette remplace la touche du
+                    clavier. Il lit la manette avec DirectInput : vérifie une fois avec « Tester dans DeSmuME ».
+                  {:else}
+                    melonDS utilise la première manette branchée. Les numéros de boutons suivent les pilotes habituels de
+                    melonDS : vérifie une fois avec « Tester dans melonDS ».
+                  {/if}
                 </p>
-                {#each KEY_ROWS as group}
+                {#each rowsFor(joy) as group}
                   <h3>{group.title}</h3>
                   <div class="keys">
                     {#each group.items as it}
                       <div class="krow">
                         <span class="klabel">{it.label}</span>
                         <button class="kbtn" class:wait={padCapturing === it.name} onclick={() => capturePad(it.name)}>
-                          {padCapturing === it.name ? "Appuie sur la manette…" : sdlName(padKind ?? "xbox", joy[it.name] ?? -1)}
+                          {padCapturing === it.name ? "Appuie sur la manette…" : codec?.padName(padKind ?? "xbox", joy[it.name] ?? -1)}
                         </button>
                         <button
                           class="icon"
@@ -1456,39 +1535,131 @@
                 <div class="row">
                   <span class="lbl">Directions<small>Utilisées par « Valeurs conseillées ».</small></span>
                   <div class="seg" role="group" aria-label="Directions">
-                    <button class:on={padDirs === "dpad"} aria-pressed={padDirs === "dpad"} onclick={() => setPadDirs("dpad")}>Croix</button>
+                    <button class:on={dpadOn} aria-pressed={dpadOn} onclick={() => setPadDirs("dpad")}>Croix</button>
                     <button class:on={padDirs === "stick"} aria-pressed={padDirs === "stick"} onclick={() => setPadDirs("stick")}>Stick gauche</button>
-                    <button class:on={padDirs === "both"} aria-pressed={padDirs === "both"} onclick={() => setPadDirs("both")}>Les deux</button>
+                    {#if codec?.bothDirections}
+                      <button class:on={padDirs === "both"} aria-pressed={padDirs === "both"} onclick={() => setPadDirs("both")}>Les deux</button>
+                    {/if}
                   </div>
                 </div>
                 <div class="kreset sheet-acts">
-                  <button onclick={() => saveJoy(padSuggested(padKind ?? "xbox", padDirs))}>Valeurs conseillées</button>
-                  <button onclick={openEmulator} disabled={!melondsOk}>Tester dans melonDS</button>
+                  <button onclick={() => codec && saveJoy(codec.padSuggested(padKind ?? "xbox", padDirs))}>Valeurs conseillées</button>
+                  <button onclick={openEmulator} disabled={!emuReady}>Tester dans {dsEmu?.name}</button>
                 </div>
               </div>
             </section>
           {/if}
 
-          <section>
-            <h2>Démarrage</h2>
-            <div class="rows">
-              <label class="row">
-                <span class="lbl">
-                  Lancer directement le jeu
-                  <small>
-                    Saute le menu de la console. Décoché, melonDS démarre via le firmware, un fichier de ta propre console
-                    que VemuZ ne fournit pas.
-                  </small>
-                </span>
-                <input type="checkbox" bind:checked={emu.direct_boot} onchange={saveEmu} />
-              </label>
-            </div>
-          </section>
+          {#if advItems.length > 0}
+            <section>
+              <h2>Avancé</h2>
+              <div class="rows">
+                <div class="row">
+                  <span class="lbl">
+                    Réglages avancés
+                    <small>Pour ajuster finement {dsEmu?.name}. Les valeurs par défaut conviennent à la plupart des jeux.</small>
+                  </span>
+                  <button aria-expanded={showAdvanced} onclick={() => (showAdvanced = !showAdvanced)}>
+                    {showAdvanced ? "Masquer" : "Afficher"}
+                  </button>
+                </div>
+                {#if showAdvanced}
+                  {#each advItems as s (s.id)}{@render settingRow(s)}{/each}
+                {/if}
+              </div>
+            </section>
+          {/if}
         {/if}
       {/if}
     </div>
   {/if}
 </main>
+
+<!-- Configuration d'une console : choix de l'émulateur et de son dossier -->
+{#if setup && setupConsole}
+  <div class="sheet-back" role="presentation" onclick={closeSetup} transition:fadeIn></div>
+  <div
+    class="sheet"
+    role="dialog"
+    aria-modal="true"
+    aria-label="Configurer {setupConsole.name}"
+    tabindex="-1"
+    transition:slide={{ x: 440, duration: 360 }}
+  >
+    <div class="sheet-head setup-head">
+      <svg class="setup-art" viewBox="0 0 64 48" aria-hidden="true">{@html setupConsole.draw}</svg>
+      <div class="sheet-id">
+        <h2>{setupConsole.name}</h2>
+        <p class="hint">Configuration</p>
+      </div>
+      <button class="icon sheet-close" title="Fermer" aria-label="Fermer" onclick={closeSetup}>
+        <svg viewBox="0 0 16 16"><path d="M4 4l8 8M12 4l-8 8" /></svg>
+      </button>
+    </div>
+
+    <p class="lead">
+      Pour jouer, VemuZ s'appuie sur un émulateur gratuit que tu installes toi-même, puis tu lui indiques son dossier.
+    </p>
+
+    {#if setupEmus.length > 1}
+      <div class="seg" role="group" aria-label="Émulateur">
+        {#each setupEmus as e (e.id)}
+          <button class:on={setupEmu?.id === e.id} aria-pressed={setupEmu?.id === e.id} onclick={() => (setupEmuId = e.id)}>
+            {e.name}{e.recommended ? " (conseillé)" : ""}
+          </button>
+        {/each}
+      </div>
+    {/if}
+
+    {#if setupEmu}
+      {#if setupEmu.dir && !setupEmu.ok}
+        <p class="status ko">
+          <span class="dot"></span>{setupEmu.name} n'est plus dans <code>{setupEmu.dir}</code>.
+        </p>
+      {/if}
+
+      {#if detecting}
+        <p class="hint">Recherche de {setupEmu.name} sur ton ordinateur…</p>
+      {:else if setupFound.length > 0}
+        <h3>{setupFound.length > 1 ? `${setupEmu.name} est installé à plusieurs endroits` : `${setupEmu.name} est déjà installé`}</h3>
+        <ul class="found">
+          {#each setupFound as d, i (d.dir)}
+            <li>
+              <code>{d.dir}</code>
+              <button class:primary={i === 0} onclick={() => useDir(d.emu, d.dir)}>Utiliser</button>
+            </li>
+          {/each}
+        </ul>
+        <p class="hint">
+          {setupFound.length > 1 ? "Aucun ne convient ?" : "Ce n'est pas le bon ?"}
+          <button class="link" onclick={() => chooseEmuDir(setupEmu)}>Choisis un autre dossier</button>.
+        </p>
+      {:else}
+        <h3>Installer {setupEmu.name}</h3>
+        <ol class="steps">
+          {#if setupEmu.download}
+            <li>
+              <span>Télécharge la version Windows sur le site officiel de {setupEmu.name}.</span>
+              <button class="primary" onclick={() => setupEmu && openDownload(setupEmu.id)}>Ouvrir le site</button>
+            </li>
+          {/if}
+          <li>
+            <span>Décompresse le fichier dans un dossier, par exemple <code>Documents\{setupEmu.name}</code>.</span>
+          </li>
+          <li>
+            <span>Indique ce dossier à VemuZ.</span>
+            <span class="step-acts">
+              <button onclick={() => setup && detect(setup)}>Rechercher à nouveau</button>
+              <button onclick={() => chooseEmuDir(setupEmu)}>Choisir le dossier</button>
+            </span>
+          </li>
+        </ol>
+      {/if}
+    {/if}
+
+    <p class="legal">VemuZ ne fournit ni jeux, ni BIOS, ni firmware.</p>
+  </div>
+{/if}
 
 {#if sheet}
   <div class="sheet-back" role="presentation" onclick={closeSheet} transition:fadeIn></div>
@@ -1505,7 +1676,7 @@
         <h2>{label(sheet)}</h2>
         <p class="hint">{sheet.code || "Code inconnu"}</p>
         <div class="sheet-acts">
-          <button class="primary" onclick={() => sheet && launch(sheet)} disabled={!melondsOk}>Lancer</button>
+          <button class="primary" onclick={() => sheet && launch(sheet)} disabled={!emuReady}>Lancer</button>
           <button class="fav-toggle" class:on={sheet.favorite} aria-pressed={!!sheet.favorite} onclick={() => sheet && toggleFavorite(sheet)}>
             <svg viewBox="0 0 16 16"><path d="M8 1.8l1.9 3.9 4.3.6-3.1 3 .7 4.3L8 11.6l-3.8 2 .7-4.3-3.1-3 4.3-.6z" /></svg>
             {sheet.favorite ? "Favori" : "Ajouter aux favoris"}
@@ -1655,7 +1826,7 @@
   <footer class="pad-help" aria-hidden="true" transition:slide={{ y: 24, duration: 280 }}>
     <span><kbd>A</kbd>Valider</span>
     <span><kbd>B</kbd>Retour</span>
-    {#if view !== "welcome"}<span><kbd>LB</kbd><kbd>RB</kbd>Onglets</span>{/if}
+    <span><kbd>LB</kbd><kbd>RB</kbd>Onglets</span>
     {#if view === "library" && games.length > 0 && !sheet}<span><kbd>X</kbd>Fiche</span><span><kbd>Y</kbd>Rechercher</span>{/if}
   </footer>
 {/if}
@@ -2285,23 +2456,13 @@
     margin-top: 20px;
   }
 
-  /* Premier lancement */
-  .welcome {
-    max-width: 640px;
-  }
+  /* Panneau de configuration d'une console */
   .lead {
     color: var(--text-soft);
     font-size: var(--fs-3);
     line-height: 1.5;
     margin: 12px 0 28px;
     max-width: 52ch;
-  }
-  .welcome h2 {
-    margin: 0 0 14px;
-    padding: 0;
-  }
-  .welcome > .status {
-    margin: -12px 0 24px;
   }
   .found {
     list-style: none;
@@ -2496,6 +2657,40 @@
   }
   .tile.on:not(.soon) .tile-state {
     color: var(--accent);
+  }
+  /* Console prise en charge mais pas encore prête : petite pastille */
+  .tile-state.todo::before {
+    content: "";
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    margin-right: 6px;
+    border-radius: 50%;
+    background: var(--accent);
+    vertical-align: middle;
+  }
+  .setup-head {
+    align-items: center;
+  }
+  .setup-art {
+    flex: none;
+    width: 72px;
+    height: 54px;
+    fill: none;
+    stroke: var(--accent);
+    stroke-width: 1.6;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+  .sheet .lead {
+    font-size: var(--fs-2);
+    margin: 8px 0 20px;
+  }
+  .sheet .status {
+    margin: 0 0 16px;
+  }
+  .sheet .seg {
+    margin-bottom: 20px;
   }
 
   /* Groupes par franchise */

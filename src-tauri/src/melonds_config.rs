@@ -16,6 +16,8 @@ pub struct EmuConfig {
     pub screen_filter: bool,
     /// Rendu OpenGL (rapide) au lieu du rendu logiciel (compatible)
     pub fast_renderer: bool,
+    /// Définition de la 3D en rendu OpenGL : multiple de 256 x 192 (1 à 8)
+    pub resolution: i64,
     pub limit_fps: bool,
     pub jit: bool,
     /// 0 à 100
@@ -186,6 +188,8 @@ mod tests {
         c.jit = true; // section [JIT] absente : doit être créée
         c.pause_on_blur = true; // clé racine absente : ajoutée en tête
         c.fast_renderer = true;
+        assert_eq!(c.resolution, 1); // section [3D.GL] absente : définition d'origine
+        c.resolution = 4;
         assert_eq!(c.fast_forward, 1000); // valeur absente : plafonnée à 1000 %
         c.fast_forward = 200;
         write(&path, &c).unwrap();
@@ -196,6 +200,7 @@ mod tests {
         assert!(out.contains("[JIT]\r\nEnable = true"));
         assert!(out.contains("[Screen]\r\nUseGL = true") || out.contains("UseGL = true"));
         assert!(out.contains("FastForwardFPS = 120.0"));
+        assert!(out.contains("[3D.GL]\r\nScaleFactor = 4"));
         assert!(out.starts_with("PauseLostFocus = true\r\n") || out.starts_with("FastForwardFPS"));
         assert!(!out.replace("\r\n", "").contains('\n'), "fins de ligne CRLF conservées");
         let back = read(&path).unwrap();
@@ -216,6 +221,7 @@ pub fn read(path: &Path) -> Result<EmuConfig, String> {
         integer_scaling: get_bool(&l, WIN, "IntegerScaling", false),
         screen_filter: get_bool(&l, WIN, "ScreenFilter", true),
         fast_renderer: get_int(&l, "3D", "Renderer", 0) != 0,
+        resolution: get_int(&l, "3D.GL", "ScaleFactor", 1).clamp(1, 8),
         limit_fps: get_bool(&l, "", "LimitFPS", true),
         jit: get_bool(&l, "JIT", "Enable", false),
         volume: (get_int(&l, "Instance0.Audio", "Volume", 256) * 100 + 128) / 256,
@@ -243,6 +249,7 @@ pub fn write(path: &Path, c: &EmuConfig) -> Result<(), String> {
     // Le rendu OpenGL exige aussi l'affichage OpenGL
     set(&mut l, "3D", "Renderer", if c.fast_renderer { "1" } else { "0" });
     set(&mut l, "Screen", "UseGL", b(c.fast_renderer));
+    set(&mut l, "3D.GL", "ScaleFactor", &c.resolution.clamp(1, 8).to_string());
     set(&mut l, "", "LimitFPS", b(c.limit_fps));
     set(&mut l, "JIT", "Enable", b(c.jit));
     set(&mut l, "Instance0.Audio", "Volume", &((c.volume.clamp(0, 100) * 256 + 50) / 100).to_string());

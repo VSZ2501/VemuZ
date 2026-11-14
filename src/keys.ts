@@ -120,6 +120,9 @@ export const KEY_ROWS: { title: string; items: { name: string; label: string }[]
       { name: "HK_FastForward", label: "Avance rapide" },
       { name: "HK_Reset", label: "Redémarrer le jeu" },
       { name: "HK_SwapScreens", label: "Échanger les écrans" },
+      // Seulement dans les émulateurs qui les proposent (DeSmuME)
+      { name: "HK_SpeedUp", label: "Accélérer" },
+      { name: "HK_SpeedDown", label: "Ralentir" },
     ],
   },
 ];

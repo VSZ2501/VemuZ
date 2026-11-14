@@ -1,6 +1,6 @@
-//! Sauvegardes des jeux : où melonDS les écrit, copies automatiques, restauration.
-//! melonDS nomme le .sav d'après la ROM (pour une archive : la ROM qu'elle contient) et le range
-//! dans SaveFilePath, sinon à côté de la ROM. Les sauvegardes rapides suivent la même règle (.ml0 à .ml9).
+//! Sauvegardes des jeux : où l'émulateur les écrit, copies automatiques, restauration.
+//! Les émulateurs nomment la sauvegarde d'après la ROM (pour une archive : la ROM qu'elle contient),
+//! avec leur propre extension et leur propre dossier (`SaveLayout`).
 
 use crate::archive;
 use serde::Serialize;
@@ -35,7 +35,19 @@ pub struct SaveInfo {
     pub backups: Vec<FileInfo>,
 }
 
-/// Dossier et nom de base (sans extension) utilisés par melonDS pour ce jeu.
+/// Où et sous quel nom un émulateur range les sauvegardes d'un jeu.
+pub struct SaveLayout {
+    /// Dossier des sauvegardes ; None : à côté de la ROM
+    pub save_dir: Option<PathBuf>,
+    /// Dossier des sauvegardes rapides ; None : à côté de la ROM
+    pub state_dir: Option<PathBuf>,
+    /// Extension de la sauvegarde ("sav", "dsv")
+    pub save_ext: &'static str,
+    /// Début de l'extension des sauvegardes rapides, suivi du numéro d'emplacement ("ml" donne .ml0)
+    pub state_ext: &'static str,
+}
+
+/// Dossier et nom de base (sans extension) utilisés par l'émulateur pour ce jeu.
 fn rom_base(game: &Path) -> Option<(PathBuf, String)> {
     let dir = game.parent()?.to_path_buf();
     let name = if archive::is_archive(game) {
@@ -47,10 +59,10 @@ fn rom_base(game: &Path) -> Option<(PathBuf, String)> {
     Some((dir, stem))
 }
 
-/// Chemin du .sav de ce jeu. `save_dir` : dossier réglé dans melonDS, sinon celui de la ROM.
-pub fn save_file(game: &Path, save_dir: Option<&Path>) -> Option<PathBuf> {
+/// Chemin de la sauvegarde de ce jeu (même si elle n'existe pas encore).
+pub fn save_file(game: &Path, layout: &SaveLayout) -> Option<PathBuf> {
     let (dir, stem) = rom_base(game)?;
-    Some(save_dir.map_or(dir, Path::to_path_buf).join(format!("{stem}.sav")))
+    Some(layout.save_dir.clone().unwrap_or(dir).join(format!("{stem}.{}", layout.save_ext)))
 }
 
 fn modified_ms(meta: &fs::Metadata) -> u64 {
@@ -71,12 +83,12 @@ fn info(path: &Path) -> Option<FileInfo> {
 }
 
 /// Sauvegardes rapides présentes (emplacements 0 à 9).
-fn states(game: &Path, state_dir: Option<&Path>) -> Vec<StateInfo> {
+fn states(game: &Path, layout: &SaveLayout) -> Vec<StateInfo> {
     let Some((dir, stem)) = rom_base(game) else { return Vec::new() };
-    let dir = state_dir.map_or(dir, Path::to_path_buf);
+    let dir = layout.state_dir.clone().unwrap_or(dir);
     (0..=9u8)
         .filter_map(|slot| {
-            let meta = fs::metadata(dir.join(format!("{stem}.ml{slot}"))).ok()?;
+            let meta = fs::metadata(dir.join(format!("{stem}.{}{slot}", layout.state_ext))).ok()?;
             Some(StateInfo { slot, modified: modified_ms(&meta) })
         })
         .collect()
@@ -146,12 +158,12 @@ pub fn backup_key(code: &str, game: &Path) -> String {
     stem.chars().map(|c| if c.is_alphanumeric() || c == ' ' || c == '-' { c } else { '_' }).collect()
 }
 
-pub fn get(game: &Path, save_dir: Option<&Path>, state_dir: Option<&Path>, backup_dir: &Path) -> SaveInfo {
-    let expected = save_file(game, save_dir);
+pub fn get(game: &Path, layout: &SaveLayout, backup_dir: &Path) -> SaveInfo {
+    let expected = save_file(game, layout);
     SaveInfo {
         save: expected.as_deref().and_then(info),
         expected: expected.map(|p| p.to_string_lossy().into_owned()),
-        states: states(game, state_dir),
+        states: states(game, layout),
         backups: list_backups(backup_dir),
     }
 }
@@ -170,11 +182,11 @@ mod tests {
     #[test]
     fn chemins_de_sauvegarde() {
         let rom = Path::new("C:\\Jeux\\Mario Kart (E).nds");
-        assert_eq!(save_file(rom, None), Some(PathBuf::from("C:\\Jeux\\Mario Kart (E).sav")));
-        assert_eq!(
-            save_file(rom, Some(Path::new("D:\\Saves"))),
-            Some(PathBuf::from("D:\\Saves\\Mario Kart (E).sav"))
-        );
+        let near = SaveLayout { save_dir: None, state_dir: None, save_ext: "sav", state_ext: "ml" };
+        let elsewhere =
+            SaveLayout { save_dir: Some(PathBuf::from("D:\\Battery")), state_dir: None, save_ext: "dsv", state_ext: "ds" };
+        assert_eq!(save_file(rom, &near), Some(PathBuf::from("C:\\Jeux\\Mario Kart (E).sav")));
+        assert_eq!(save_file(rom, &elsewhere), Some(PathBuf::from("D:\\Battery\\Mario Kart (E).dsv")));
         assert_eq!(backup_key("AMCE", rom), "AMCE");
         assert_eq!(backup_key("", rom), "Mario Kart _E_");
     }
