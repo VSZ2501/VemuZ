@@ -11,6 +11,11 @@ vite.config.ts.timestamp-*
 !.env.example
 .DS_Store
 
+# Outils de travail locaux (Claude Code, suivi d'avancement)
+.claude/
+PROGRESS.md
+CLAUDE.md
+
 # Jeux et sauvegardes (jamais versionnés)
 *.nds
 *.sav

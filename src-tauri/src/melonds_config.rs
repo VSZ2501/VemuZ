@@ -57,6 +57,25 @@ fn get<'a>(lines: &'a [String], section: &str, key: &str) -> Option<&'a str> {
     None
 }
 
+/// Valeur texte TOML ("..."), sans les guillemets ni les échappements simples.
+fn unquote(v: &str) -> String {
+    let v = v.trim();
+    let v = v.strip_prefix('"').and_then(|x| x.strip_suffix('"')).unwrap_or(v);
+    v.replace("\\\\", "\\").replace("\\\"", "\"")
+}
+
+/// Dossiers des sauvegardes (.sav) et des sauvegardes rapides (.ml0 à .ml9) réglés dans melonDS.
+/// None : à côté de la ROM. Un chemin relatif part du dossier de melonDS.
+pub fn asset_dirs(config: &Path, melonds_dir: &Path) -> (Option<PathBuf>, Option<PathBuf>) {
+    let Ok(content) = fs::read_to_string(config) else { return (None, None) };
+    let l: Vec<String> = content.lines().map(String::from).collect();
+    let dir = |key: &str| {
+        let v = unquote(get(&l, "Instance0", key)?);
+        (!v.is_empty()).then(|| melonds_dir.join(v))
+    };
+    (dir("SaveFilePath"), dir("SavestatePath"))
+}
+
 fn get_bool(lines: &[String], section: &str, key: &str, default: bool) -> bool {
     match get(lines, section, key) {
         Some("true") => true,
@@ -129,6 +148,28 @@ mod tests {
         assert_eq!((back["A"], back["Up"], back["B"]), (0x58, 0x01000013, -1));
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("toml.bak"));
+    }
+
+    #[test]
+    fn manette_lue_ecrite_sans_toucher_au_clavier() {
+        let path = std::env::temp_dir().join(format!("vemuz_test_joy_{}.toml", std::process::id()));
+        fs::write(&path, "[Instance0.Keyboard]\nA = 88\n\n[Instance0.Joystick]\nA = -1\nB = 3\n").unwrap();
+        let mut j = read_joy(&path).unwrap();
+        assert_eq!((j["A"], j["B"], j["Up"]), (-1, 3, -1));
+        // Bouton 1, direction haut de la croix 0, axe 5 en positif
+        j.insert("A".into(), 1);
+        j.insert("Up".into(), 0x101);
+        j.insert("HK_FastForward".into(), 0x1501FFFF);
+        // Flèche (bouton 11) et stick gauche vers le haut dans la même touche
+        j.insert("Down".into(), 0x0111000B);
+        write_joy(&path, &j).unwrap();
+        let back = read_joy(&path).unwrap();
+        let keys = read_keys(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("toml.bak"));
+        assert_eq!((back["A"], back["Up"], back["HK_FastForward"], back["B"]), (1, 0x101, 0x1501FFFF, 3));
+        assert_eq!(keys["A"], 88, "le clavier n'est pas touché");
+        assert_eq!(back["Down"], 0x0111000B, "bouton et axe combinés conservés");
     }
 
     const SAMPLE: &str = "RecentROM = [\"a.nds\"]\r\nLimitFPS = true\r\n\r\n[Emu]\r\nDirectBoot = true\r\n\r\n[Instance0.Window0]\r\nScreenLayout = 0\r\nScreenSwap = false\r\n\r\n[Instance0.Audio]\r\nVolume = 256\r\n";
@@ -236,21 +277,41 @@ pub const KEYS: [&str; 17] = [
     "HK_FullscreenToggle", "HK_Pause", "HK_FastForward", "HK_Reset", "HK_SwapScreens",
 ];
 
-/// Codes de touche Qt par nom ; -1 si non assignée.
-pub fn read_keys(path: &Path) -> Result<HashMap<String, i64>, String> {
+const JOYSTICK: &str = "Instance0.Joystick";
+
+/// Valeurs d'une section de touches, par nom ; -1 si non assignée.
+fn read_section(path: &Path, section: &str) -> Result<HashMap<String, i64>, String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let l: Vec<String> = content.lines().map(String::from).collect();
-    Ok(KEYS.iter().map(|k| (k.to_string(), get_int(&l, KEYBOARD, k, -1))).collect())
+    Ok(KEYS.iter().map(|k| (k.to_string(), get_int(&l, section, k, -1))).collect())
 }
 
-pub fn write_keys(path: &Path, keys: &HashMap<String, i64>) -> Result<(), String> {
+fn write_section(path: &Path, section: &str, keys: &HashMap<String, i64>) -> Result<(), String> {
     let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
     let eol = if content.contains("\r\n") { "\r\n" } else { "\n" };
     let mut l: Vec<String> = content.lines().map(String::from).collect();
     for name in KEYS {
         if let Some(v) = keys.get(name) {
-            set(&mut l, KEYBOARD, name, &(*v).max(-1).to_string());
+            set(&mut l, section, name, &(*v).max(-1).to_string());
         }
     }
     save(path, &l, eol)
+}
+
+/// Touches du clavier : codes Qt.
+pub fn read_keys(path: &Path) -> Result<HashMap<String, i64>, String> {
+    read_section(path, KEYBOARD)
+}
+
+pub fn write_keys(path: &Path, keys: &HashMap<String, i64>) -> Result<(), String> {
+    write_section(path, KEYBOARD, keys)
+}
+
+/// Boutons de la manette : codes SDL encodés par melonDS (bouton, direction de croix ou axe).
+pub fn read_joy(path: &Path) -> Result<HashMap<String, i64>, String> {
+    read_section(path, JOYSTICK)
+}
+
+pub fn write_joy(path: &Path, keys: &HashMap<String, i64>) -> Result<(), String> {
+    write_section(path, JOYSTICK, keys)
 }
