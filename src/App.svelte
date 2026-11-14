@@ -32,6 +32,7 @@
     cover_size?: string;
     theme?: string;
     pad_directions?: string;
+    keep_window?: boolean;
   };
   type EmuConfig = {
     screen_layout: number;
@@ -231,6 +232,16 @@
     if (!melondsOk) {
       view = "welcome";
       detect();
+    } else {
+      // Fenêtre recréée après un jeu : retour sur la vue d'avant, jeu lancé sélectionné
+      const resume = await invoke<{ view: string; game: string | null } | null>("get_resume");
+      if (resume && (resume.view === "consoles" || resume.view === "library" || resume.view === "settings")) {
+        view = resume.view;
+        if (resume.game) {
+          await tick();
+          document.querySelector<HTMLElement>(`.card[data-path="${CSS.escape(resume.game)}"] > .box`)?.focus();
+        }
+      }
     }
 
     const cached = await invoke<Record<string, string>>("list_covers");
@@ -474,10 +485,19 @@
     }
   }
 
+  async function saveKeepWindow(keep: boolean) {
+    try {
+      settings = await invoke<Settings>("set_keep_window", { keep });
+    } catch (e) {
+      message = errText(e);
+    }
+  }
+
   async function openEmulator() {
     message = "";
     try {
       await invoke("open_emulator");
+      await invoke("sleep_window", { view, game: null });
     } catch (e) {
       message = errText(e);
     }
@@ -897,7 +917,8 @@
       return;
     }
     await pause(Math.max(0, LAUNCH_TOTAL - (performance.now() - start)));
-    await invoke("minimize_window").catch(() => {});
+    // Ferme ou réduit la fenêtre selon le réglage (si fermée, la suite ne s'exécute pas)
+    await invoke("sleep_window", { view, game: g.path }).catch(() => {});
     launching = null;
     ghost = null;
     games = await invoke<Game[]>("list_games");
@@ -1216,6 +1237,16 @@
             </span>
             <button onclick={openEmulator} disabled={!melondsOk}>Ouvrir melonDS</button>
           </div>
+          <label class="row">
+            <span class="lbl">
+              Libérer la mémoire pendant le jeu
+              <small>
+                VemuZ se ferme pendant la partie et revient quand tu quittes melonDS. Son icône près de l'horloge le rouvre
+                à tout moment.
+              </small>
+            </span>
+            <input type="checkbox" checked={!settings.keep_window} onchange={(e) => saveKeepWindow(!e.currentTarget.checked)} />
+          </label>
         </div>
       </section>
 

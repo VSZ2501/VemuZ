@@ -13,7 +13,12 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{
+    AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, RunEvent, State, WebviewWindow, WebviewWindowBuilder,
+    WindowEvent,
+};
 
 const SETTINGS_FILE: &str = "settings.json";
 const GAMES_FILE: &str = "games.json";
@@ -32,6 +37,24 @@ struct Settings {
     /// Directions de la manette dans melonDS : "dpad", "stick" ou "both" (vide : les deux)
     #[serde(default)]
     pad_directions: String,
+    /// Vrai : la fenêtre est seulement réduite pendant un jeu (sinon fermée pour libérer la mémoire)
+    #[serde(default)]
+    keep_window: bool,
+}
+
+/// Vue à rouvrir quand la fenêtre est recréée après un jeu.
+#[derive(Serialize, Clone)]
+struct Resume {
+    view: String,
+    game: Option<String>,
+}
+
+/// Position et taille de la fenêtre avant sa fermeture.
+#[derive(Clone, Copy)]
+struct Geometry {
+    maximized: bool,
+    pos: PhysicalPosition<i32>,
+    size: PhysicalSize<u32>,
 }
 
 #[derive(Default)]
@@ -41,6 +64,8 @@ struct AppState {
     running: AtomicBool,
     // Vrai quand le worker de jaquettes tourne
     fetching: AtomicBool,
+    resume: Mutex<Option<Resume>>,
+    geometry: Mutex<Option<Geometry>>,
 }
 
 // ---------- Réglages ----------
@@ -95,16 +120,80 @@ fn set_pad_directions(app: AppHandle, state: State<AppState>, directions: String
     Ok(settings.clone())
 }
 
-/// Réduit la fenêtre de VemuZ à la fin de l'animation de lancement,
-/// sauf si melonDS s'est déjà refermé entre-temps.
+/// Met VemuZ en veille à la fin de l'animation de lancement : fenêtre fermée (WebView2 libérée)
+/// ou seulement réduite selon le réglage. Ignoré si melonDS s'est déjà refermé.
+/// Asynchrone : la fenêtre qui appelle est détruite, ce qui bloquerait une commande synchrone.
 #[tauri::command]
-fn minimize_window(app: AppHandle, state: State<AppState>) {
+async fn sleep_window(app: AppHandle, view: String, game: Option<String>) -> Result<(), String> {
+    let state = app.state::<AppState>();
     if !state.running.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    *state.resume.lock().unwrap() = Some(Resume { view, game });
+    let Some(w) = app.get_webview_window("main") else { return Ok(()) };
+    let keep = state.settings.lock().unwrap().keep_window;
+    if keep {
+        let _ = w.minimize();
+    } else {
+        remember_geometry(&w);
+        let _ = w.destroy();
+    }
+    Ok(())
+}
+
+/// Vue à rouvrir après un jeu (rien au démarrage normal).
+#[tauri::command]
+fn get_resume(state: State<AppState>) -> Option<Resume> {
+    state.resume.lock().unwrap().clone()
+}
+
+/// Mémorise le choix de garder la fenêtre (réduite) pendant un jeu.
+#[tauri::command]
+fn set_keep_window(app: AppHandle, state: State<AppState>, keep: bool) -> Result<Settings, String> {
+    let mut settings = state.settings.lock().unwrap();
+    settings.keep_window = keep;
+    storage::save(&app, SETTINGS_FILE, &*settings)?;
+    Ok(settings.clone())
+}
+
+fn remember_geometry(w: &WebviewWindow) {
+    if w.is_minimized().unwrap_or(false) {
         return;
     }
+    let (Ok(pos), Ok(size)) = (w.outer_position(), w.outer_size()) else { return };
+    let maximized = w.is_maximized().unwrap_or(false);
+    *w.state::<AppState>().geometry.lock().unwrap() = Some(Geometry { maximized, pos, size });
+}
+
+/// Affiche la fenêtre, ou la recrée si elle a été fermée pendant un jeu.
+fn wake_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.minimize();
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+        return;
     }
+    // Fil séparé : sous Windows, créer une fenêtre depuis un gestionnaire d'événement bloque l'app
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let Some(mut cfg) = app.config().app.windows.first().cloned() else { return };
+        let geo = *app.state::<AppState>().geometry.lock().unwrap();
+        if geo.is_some() {
+            // Cachée le temps de reprendre la taille et la position d'avant
+            cfg.maximized = false;
+            cfg.visible = false;
+        }
+        let Ok(w) = WebviewWindowBuilder::from_config(&app, &cfg).and_then(|b| b.build()) else { return };
+        if let Some(g) = geo {
+            let _ = w.set_size(g.size);
+            let _ = w.set_position(g.pos);
+            if g.maximized {
+                let _ = w.maximize();
+            }
+            let _ = w.show();
+        }
+        let _ = w.set_focus();
+    });
 }
 
 /// Mémorise le thème de l'interface.
@@ -439,17 +528,17 @@ fn show_in_explorer(path: String) -> Result<(), String> {
 /// Lance la ROM, réduit la fenêtre, et la restaure quand l'émulateur se ferme.
 #[tauri::command]
 fn launch_game(app: AppHandle, state: State<AppState>, path: String) -> Result<(), String> {
-    run_emulator(app, &state, Some(path), false)
+    run_emulator(app, &state, Some(path))
 }
 
 /// Ouvre melonDS sans jeu, pour régler les manettes, les écrans ou les BIOS dans l'émulateur.
 #[tauri::command]
 fn open_emulator(app: AppHandle, state: State<AppState>) -> Result<(), String> {
-    run_emulator(app, &state, None, true)
+    run_emulator(app, &state, None)
 }
 
-/// Lance melonDS. `minimize` : réduire VemuZ tout de suite (sinon le frontend le fait après son animation).
-fn run_emulator(app: AppHandle, state: &AppState, rom: Option<String>, minimize: bool) -> Result<(), String> {
+/// Lance melonDS. Le frontend met ensuite VemuZ en veille (`sleep_window`).
+fn run_emulator(app: AppHandle, state: &AppState, rom: Option<String>) -> Result<(), String> {
     if state.running.swap(true, Ordering::SeqCst) {
         return Err("Un jeu est déjà en cours.".into());
     }
@@ -486,10 +575,6 @@ fn run_emulator(app: AppHandle, state: &AppState, rom: Option<String>, minimize:
         let _ = storage::save(&app, GAMES_FILE, &*games);
     }
 
-    let window = app.get_webview_window("main");
-    if minimize && let Some(w) = &window {
-        let _ = w.minimize();
-    }
     let started = std::time::Instant::now();
     std::thread::spawn(move || {
         let _ = child.wait();
@@ -504,12 +589,8 @@ fn run_emulator(app: AppHandle, state: &AppState, rom: Option<String>, minimize:
             drop(games);
             let _ = app.emit("games-updated", ());
         }
-        if let Some(w) = window {
-            let _ = w.unminimize();
-            let _ = w.show();
-            let _ = w.set_focus();
-        }
         app.state::<AppState>().running.store(false, Ordering::SeqCst);
+        wake_window(&app);
         // Copie de la sauvegarde de la partie qui vient de se terminer
         if let Some(r) = &rom {
             auto_backup(&app, r);
@@ -531,7 +612,16 @@ pub fn run() {
             *state.settings.lock().unwrap() = storage::load(handle, SETTINGS_FILE);
             *state.games.lock().unwrap() = storage::load(handle, GAMES_FILE);
             covers::start(handle);
+            tray(app)?;
             Ok(())
+        })
+        .on_window_event(|w, e| {
+            // Fermeture par la croix pendant un jeu : on retient la place de la fenêtre pour la recréer
+            if let WindowEvent::CloseRequested { .. } = e
+                && let Some(w) = w.app_handle().get_webview_window(w.label())
+            {
+                remember_geometry(&w);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
@@ -540,7 +630,9 @@ pub fn run() {
             set_cover_size,
             set_theme,
             set_pad_directions,
-            minimize_window,
+            sleep_window,
+            get_resume,
+            set_keep_window,
             get_emulator_config,
             set_emulator_config,
             get_keybindings,
@@ -566,6 +658,40 @@ pub fn run() {
             rename_game,
             launch_game
         ])
-        .run(tauri::generate_context!())
-        .expect("erreur au démarrage de VemuZ");
+        .build(tauri::generate_context!())
+        .expect("erreur au démarrage de VemuZ")
+        .run(|app, event| {
+            // Pendant un jeu, fermer la fenêtre ne quitte pas VemuZ : elle reviendra à la fin de la partie
+            if let RunEvent::ExitRequested { code: None, api, .. } = event
+                && app.state::<AppState>().running.load(Ordering::SeqCst)
+            {
+                api.prevent_exit();
+            }
+        });
+}
+
+/// Icône dans la zone de notification : rouvre VemuZ à tout moment, même pendant un jeu.
+fn tray(app: &tauri::App) -> tauri::Result<()> {
+    let open = MenuItem::with_id(app, "open", "Ouvrir VemuZ", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quitter VemuZ", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&open, &quit])?;
+    let mut tray = TrayIconBuilder::with_id("vemuz")
+        .tooltip("VemuZ")
+        .menu(&menu)
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, e| match e.id().as_ref() {
+            "open" => wake_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, e| {
+            if let TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } = e {
+                wake_window(tray.app_handle());
+            }
+        });
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
+    Ok(())
 }
